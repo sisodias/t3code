@@ -408,10 +408,10 @@ it.effect.each(deliveries)(
           assert.equal(steer.inputIntent, "promoted_queued_to_steer");
         }
         yield* worker.drain();
-        const queuesBehindActiveTurn = delivery === "scheduled message";
+        // Every delivery, automatic ones included, joins the running turn at the step boundary.
         assert.equal(batchAbort.signal.aborted, false);
-        assert.lengthOf(offers, queuesBehindActiveTurn ? 1 : 2);
-        if (!queuesBehindActiveTurn) assert.equal(offers[1]?.priority, "next");
+        assert.equal(offers.length, 2);
+        assert.equal(offers[1]?.priority, "next");
         const finished = yield* watch(
           (event) =>
             event.type === "run.updated" &&
@@ -431,18 +431,6 @@ it.effect.each(deliveries)(
         yield* worker.drain();
         yield* orchestrator.resumeQueuedRuns;
         yield* worker.drain();
-        if (queuesBehindActiveTurn) {
-          const queued = (yield* orchestrator.getThreadProjection(threadId)).runs[1]!;
-          const noticeFinished = yield* watch(
-            (event) =>
-              event.type === "run.updated" &&
-              event.payload.id === queued.id &&
-              event.payload.status === "completed",
-          );
-          yield* Queue.offer(sdkMessages, result("notice-completed", false));
-          yield* Fiber.join(noticeFinished);
-          yield* worker.drain();
-        }
         const after = yield* orchestrator.getThreadProjection(threadId);
         const reads = after.turnItems.filter((item) =>
           statusIds.includes(item.nativeItemRef?.nativeId ?? ""),
@@ -455,21 +443,20 @@ it.effect.each(deliveries)(
         }
         assert.lengthOf(offers, 2);
         assert.equal(offers.filter((offer) => offer.priority === "now").length, 0);
+        assert.deepEqual(
+          after.runs.filter((run) => run.status !== "cancelled").map((run) => run.id),
+          [parent.id],
+          "no notice waited for a turn of its own",
+        );
+        const notices = after.messages.filter((message) =>
+          delivery === "scheduled message"
+            ? message.scheduledTaskId !== undefined
+            : message.id === messageId,
+        );
+        assert.lengthOf(notices, 1);
+        assert.equal(notices[0]?.runId, parent.id);
         if (delivery === "child completion") {
-          assert.lengthOf(after.runs, 1);
-          assert.deepEqual(
-            after.messages
-              .filter((message) => message.id === messageId)
-              .map((message) => message.runId),
-            [parent.id],
-          );
           assert.equal(after.subagents[0]?.completionDelivery?.state, "delivered");
-        } else if (queuesBehindActiveTurn) {
-          assert.lengthOf(after.runs, 2);
-          assert.equal(
-            after.messages.filter((message) => message.scheduledTaskId !== undefined).length,
-            1,
-          );
         }
         yield* orchestrator.recoverDelegatedTasks;
         yield* orchestrator.resumeQueuedRuns;
