@@ -95,6 +95,7 @@ import {
   resolvePreviewAnnotationImage,
   userMessageFileLabel,
 } from "./TimelineUserMessageRow.logic";
+import { steerMarkerLabel } from "./deliveryLabels";
 
 // Drawn inside the media so dark screenshots keep an edge on the dark background.
 const MEDIA_EDGE_CLASS_NAME =
@@ -1146,6 +1147,7 @@ function UserMessageIntentMarker({
   readonly unread: boolean;
 }) {
   const gt = useGT();
+  const marker = steerMarkerLabel({ intent, unread }, gt);
   return (
     <Tooltip>
       <TooltipTrigger
@@ -1157,19 +1159,9 @@ function UserMessageIntentMarker({
         }
       >
         <Redo2Icon aria-hidden="true" className="size-3" />
-        {unread
-          ? gt("Steer · waiting to be read")
-          : gt("Steer", { $context: "noun, a message that steers the running turn" })}
+        {marker.label}
       </TooltipTrigger>
-      <TooltipPopup side="top">
-        {unread
-          ? gt(
-              "Waiting for the agent to read this. It reads steers between steps, after a running command finishes.",
-            )
-          : intent === "promoted_queued_to_steer"
-            ? gt("Originally queued, then promoted to steer the active turn")
-            : gt("Steered the active turn")}
-      </TooltipPopup>
+      <TooltipPopup side="top">{marker.detail}</TooltipPopup>
     </Tooltip>
   );
 }
