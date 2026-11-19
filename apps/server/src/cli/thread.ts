@@ -1038,7 +1038,7 @@ const threadSendCommand = Command.make("send", {
           }
           yield* flags.json
             ? printJson(sent)
-            : Console.log(sent.delivery === "queued" ? "Queued." : "Sent.");
+            : Console.log(sent.note ?? (sent.delivery === "queued" ? "Queued." : "Sent."));
         }),
       );
     }).pipe(reportThreadErrors),
