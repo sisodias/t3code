@@ -62,7 +62,7 @@ the theme, applies after T3 Code's own styles on web and desktop, and is include
 
 Custom CSS cannot load files. `@import`, `image-set()`, and `url()` are ignored, except `url()`
 with a `data:` address or an `#id`. This keeps an imported theme from sending what is on your screen
-to another site. For a full-size image, use a [background image](#background-image).
+to another site. For a full-size image or video, use a [background](#background-image-or-video).
 
 Class names in the app change between releases. For rules that keep working, target `data-slot`
 and other `data-` attributes, such as `[data-chat-header]` or `[data-slot="button"]`.
@@ -133,12 +133,21 @@ view. An optional `css` string adds [custom CSS](#custom-css).
 Write updates to a temporary file and rename it into place so clients never read a partial theme.
 Invalid files are not published.
 
-### Background image
+### Background image or video
 
-A published theme can have a full-size background image. Ask an agent, for example "use
-~/Pictures/wallpaper.jpg as T3 Code's background", or save a JPEG, PNG, or WebP file of up to
-16 MB beside the theme file: `nightfall.jpg` beside `nightfall.json`. The theme's CSS decides
-where the image shows:
+A published theme can have a full-size background image or video. Ask an agent, for example "use
+~/Pictures/wallpaper.jpg as T3 Code's background", or run this on the server:
+
+```bash
+t3 theme set nightfall --background ~/Videos/loop.webm
+```
+
+A background is a JPEG, PNG, or WebP image of up to 16 MB, or a WebM or MP4 video of up to 64 MB.
+T3 Code checks what the file holds, not only its name, and refuses anything else. Setting a new
+background replaces the theme's last one. You can also save the file beside the theme file yourself:
+`nightfall.webm` or `nightfall.jpg` beside `nightfall.json`.
+
+The theme's CSS decides where an image shows:
 
 ```css
 [data-workspace-area="conversation"] {
@@ -146,4 +155,20 @@ where the image shows:
 }
 ```
 
-Delete the image file to remove it.
+A video plays muted and looping behind the whole app. It pauses while the window is hidden or your
+system is set to reduce motion, and resumes when neither holds. It shows wherever the theme's CSS
+makes a surface transparent or translucent, and the CSS can restyle the video itself:
+
+```css
+[data-theme-background-video] {
+  filter: brightness(0.6);
+}
+[data-slot="sidebar-inset"] {
+  --background: transparent;
+}
+[data-slot="sidebar-inner"] {
+  background: color-mix(in oklab, var(--sidebar) 70%, transparent);
+}
+```
+
+Delete the background file to remove it.
