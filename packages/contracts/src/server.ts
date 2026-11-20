@@ -662,11 +662,16 @@ const environmentThemeFields = {
 export const EnvironmentThemeFile = Schema.Struct(environmentThemeFields);
 export type EnvironmentThemeFile = typeof EnvironmentThemeFile.Type;
 
+export const EnvironmentThemeBackgroundKind = Schema.Literals(["image", "video"]);
+export type EnvironmentThemeBackgroundKind = typeof EnvironmentThemeBackgroundKind.Type;
+
 export const EnvironmentTheme = Schema.Struct({
   id: EnvironmentThemeId,
   ...environmentThemeFields,
-  /** Revision of the image file published beside the theme; absent without one. */
+  /** Revision of the image or video file published beside the theme; absent without one. */
   background: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(64))),
+  /** Absent with an image from servers that publish only images. */
+  backgroundKind: Schema.optional(EnvironmentThemeBackgroundKind),
 });
 export type EnvironmentTheme = typeof EnvironmentTheme.Type;
 
