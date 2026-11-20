@@ -16,7 +16,10 @@ vi.mock(import("./state/primaryEnvironment"), async () => {
 vi.mock(import("./state/server"), async () => {
   const { Atom } = await import("effect/reactivity");
   return {
-    themeServerEnvironmentThemesAtom: Atom.make([{ id: "nightfall", background: "revision-1" }]),
+    themeServerEnvironmentThemesAtom: Atom.make([
+      { id: "nightfall", background: "revision-1" },
+      { id: "loop", background: "revision-1", backgroundKind: "video" },
+    ]),
   } as never;
 });
 vi.mock(import("./state/session"), async () => {
@@ -50,15 +53,52 @@ const image = new Blob(["image"], { type: "image/png" });
 const offline = () => Promise.reject(new TypeError("Failed to fetch"));
 const loaded = async () => ({ ok: true, blob: async () => image });
 
+function fakeVideo(body: Array<unknown>) {
+  const attributes = new Map<string, string>();
+  const element = Object.assign(new EventTarget(), {
+    attributes,
+    muted: false,
+    loop: false,
+    playsInline: false,
+    disablePictureInPicture: false,
+    preload: "",
+    src: "",
+    setAttribute: (name: string, value: string) => attributes.set(name, value),
+    removeAttribute: (name: string) => {
+      attributes.delete(name);
+      if (name === "src") element.src = "";
+    },
+    play: vi.fn(async () => {}),
+    pause: vi.fn(),
+    load: vi.fn(),
+    remove: () => {
+      const index = body.indexOf(element);
+      if (index >= 0) body.splice(index, 1);
+    },
+  });
+  return element;
+}
+
 function setup(storage: Record<string, string> = {}) {
   vi.useFakeTimers();
   const properties = new Map<string, string>();
   const browser = Object.assign(new EventTarget(), {
     localStorage: { getItem: (key: string) => storage[key] ?? null },
+    matchMedia: () => Object.assign(new EventTarget(), { matches: false }),
   });
   vi.stubGlobal("window", browser);
   invalidateCustomThemes();
-  vi.stubGlobal("document", {
+  const body: Array<unknown> = [];
+  const videos: Array<ReturnType<typeof fakeVideo>> = [];
+  const page = Object.assign(new EventTarget(), {
+    visibilityState: "visible",
+    body: { prepend: (element: unknown) => body.unshift(element) },
+    createElement: (tag: string) => {
+      expect(tag).toBe("video");
+      const video = fakeVideo(body);
+      videos.push(video);
+      return video;
+    },
     documentElement: {
       dataset: { themeId: "nightfall" },
       style: {
@@ -67,12 +107,17 @@ function setup(storage: Record<string, string> = {}) {
       },
     },
   });
+  // The video watches visibility through the window it plays in.
+  Object.assign(browser, { document: page });
+  vi.stubGlobal("document", page);
   query.mockResolvedValue({ _tag: "Success", value: { relativeUrl: "/background.png" } });
   const fetchBackground = vi.fn<() => Promise<unknown>>(offline);
   vi.stubGlobal("fetch", fetchBackground);
   const stop = startThemeBackground();
   return {
     properties,
+    body,
+    videos,
     browser,
     fetchBackground,
     stop,
@@ -152,6 +197,41 @@ describe("theme backgrounds", () => {
     else t.stop();
     await vi.advanceTimersByTimeAsync(30_000);
     expect(t.fetchBackground).toHaveBeenCalledTimes(1);
+  });
+
+  it("plays a video background from its signed URL, and mints a new one when it fails", async () => {
+    using t = setup();
+    query.mockResolvedValue({ _tag: "Success", value: { relativeUrl: "/background.webm" } });
+    applyThemeBackground("loop");
+    await vi.advanceTimersByTimeAsync(0);
+    // A video streams in ranges, so it is never downloaded whole.
+    expect(t.fetchBackground).not.toHaveBeenCalled();
+    expect(t.properties.has(BACKGROUND)).toBe(false);
+    const [first] = t.videos;
+    expect(first).toMatchObject({
+      src: "https://example.com/background.webm",
+      muted: true,
+      loop: true,
+      playsInline: true,
+    });
+    expect(first?.attributes.has("data-theme-background-video")).toBe(true);
+    expect(first?.attributes.get("aria-hidden")).toBe("true");
+    expect(t.body).toEqual([first]);
+    expect(first?.play).toHaveBeenCalledTimes(1);
+
+    // Such as a range request after the signed URL expired.
+    first?.dispatchEvent(new Event("error"));
+    await vi.advanceTimersByTimeAsync(999);
+    expect(t.videos).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(t.videos).toHaveLength(2);
+    expect(t.body).toEqual([t.videos[1]]);
+    expect(first).toMatchObject({ src: "" });
+
+    applyThemeBackground("nightfall");
+    expect(t.body).toEqual([]);
+    expect(t.videos[1]?.pause).toHaveBeenCalled();
+    expect(t.videos[1]?.load).toHaveBeenCalled();
   });
 
   it("shows no published background when a saved theme shares its id", async () => {
