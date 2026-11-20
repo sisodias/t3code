@@ -736,6 +736,21 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   body {
     @apply text-foreground relative;
   }
+  /* A theme's background video, behind everything in the body. Theme CSS may restyle it. */
+  [data-theme-background-video] {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    pointer-events: none;
+  }
+  /* The positioned body paints its background above negative z-index children. The browser
+     chrome sync sets the body's color inline, so only an important declaration clears it. */
+  body:has(> [data-theme-background-video]) {
+    background-color: transparent !important;
+  }
 }
 
 @layer components {
