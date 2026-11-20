@@ -55,10 +55,16 @@ const ThemeReadTool = Tool.make("t3_theme_read", {
 const ThemeSetTool = Tool.make("t3_theme_set", {
   ...shared,
   description:
-    "Restyle T3 Code itself, only when the user asks. With `theme`, publish it as `themeId` (same id updates it) and switch this server's web app and this machine's desktop app to it, not remote desktop apps. Without `theme`, switch to a built-in or published `themeId`. `appearance` sets light, dark, or system mode. Live full-access or default caller thread only.",
+    "Restyle T3 Code itself, only when the user asks. With `theme`, publish it as `themeId` (same id updates it) and switch this server's web app and this machine's desktop app to it, not remote desktop apps. Without `theme`, switch to a built-in or published `themeId`. `background` puts an image or video behind a published theme. `appearance` sets light, dark, or system mode. Live full-access or default caller thread only.",
   parameters: Schema.Struct({
     themeId: Schema.optionalKey(EnvironmentThemeId),
     theme: Schema.optionalKey(EnvironmentThemeFile),
+    background: Schema.optionalKey(
+      Schema.String.annotate({
+        description:
+          "Absolute path on this machine of a JPEG, PNG, or WebP image up to 16 MB, or a WebM or MP4 video up to 64 MB, to copy beside the theme as its background. It replaces the theme's previous background.",
+      }),
+    ),
     appearance: Schema.optionalKey(Appearance),
   }),
   success: Schema.Struct({

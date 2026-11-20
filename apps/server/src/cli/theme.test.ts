@@ -41,6 +41,17 @@ const NIGHTFALL_THEME_JSON = `${JSON.stringify({
   accent: "#7aa2f7",
 })}\n`;
 const JUNK_THEME_JSON = `${JSON.stringify({ name: "Junk" })}\n`;
+/** First bytes of a WebM and an MP4 as ffmpeg writes them, padded with zeros. */
+const media = (header: string, encoding: "hex" | "latin1") => {
+  const bytes = Buffer.alloc(512);
+  Buffer.from(header, encoding).copy(bytes);
+  return bytes;
+};
+const WEBM = media(
+  "1a45dfa39f4286810142f7810142f2810442f381084282847765626d4287810242858102",
+  "hex",
+);
+const MP4 = media("\0\0\0\x20ftypisom\0\0\x02\0isomiso2avc1mp41", "latin1");
 
 const readSettings = (baseDir: string): Record<string, unknown> => {
   const raw = NodeFS.readFileSync(settingsPathFor(baseDir), "utf8");
@@ -260,6 +271,123 @@ describe("t3 theme", () => {
       } finally {
         NodeFS.chmodSync(userdataDir, 0o755);
       }
+    }),
+  );
+
+  it.effect("publishes a theme file with a background video and sets it", () =>
+    Effect.gen(function* () {
+      const baseDir = makeBaseDir();
+      const themeFile = NodePath.join(baseDir, "nightfall.json");
+      NodeFS.writeFileSync(themeFile, NIGHTFALL_THEME_JSON);
+      const clip = NodePath.join(baseDir, "clip.webm");
+      NodeFS.writeFileSync(clip, WEBM);
+
+      yield* runCli(["theme", "set", themeFile, "--background", clip, "--base-dir", baseDir]);
+
+      const themesDir = NodePath.join(baseDir, "userdata", "themes");
+      assert.deepEqual(NodeFS.readdirSync(themesDir).sort(), ["nightfall.json", "nightfall.webm"]);
+      assert.deepEqual(NodeFS.readFileSync(NodePath.join(themesDir, "nightfall.webm")), WEBM);
+      assert.equal(readSettings(baseDir).defaultTheme, "nightfall");
+    }),
+  );
+
+  it.effect("gives a published theme a new background in place of its last one", () =>
+    Effect.gen(function* () {
+      const baseDir = makeBaseDir();
+      const themesDir = NodePath.join(baseDir, "userdata", "themes");
+      NodeFS.mkdirSync(themesDir, { recursive: true });
+      NodeFS.writeFileSync(NodePath.join(themesDir, "nightfall.json"), NIGHTFALL_THEME_JSON);
+      NodeFS.writeFileSync(NodePath.join(themesDir, "nightfall.webm"), WEBM);
+      // Named for neither format: the copy is named for its bytes.
+      const clip = NodePath.join(baseDir, "clip.video");
+      NodeFS.writeFileSync(clip, MP4);
+
+      yield* runCli(["theme", "set", "nightfall", "--background", clip, "--base-dir", baseDir]);
+
+      assert.deepEqual(NodeFS.readdirSync(themesDir).sort(), ["nightfall.json", "nightfall.mp4"]);
+      assert.equal(readSettings(baseDir).defaultTheme, "nightfall");
+    }),
+  );
+
+  it.effect("refuses a background that is not an image or video, and sets nothing", () =>
+    Effect.gen(function* () {
+      const baseDir = makeBaseDir();
+      const themeFile = NodePath.join(baseDir, "nightfall.json");
+      NodeFS.writeFileSync(themeFile, NIGHTFALL_THEME_JSON);
+      const notes = NodePath.join(baseDir, "notes.webm");
+      NodeFS.writeFileSync(notes, "<svg onload=alert(1)>");
+
+      const failure = yield* runCli([
+        "theme",
+        "set",
+        themeFile,
+        "--background",
+        notes,
+        "--base-dir",
+        baseDir,
+      ]).pipe(Effect.flip);
+
+      assert.include(
+        String(failure),
+        `${notes} is not a JPEG, PNG, or WebP image, or a WebM or MP4 video.`,
+      );
+      assert.deepEqual(NodeFS.readdirSync(NodePath.join(baseDir, "userdata", "themes")), []);
+      assert.equal(NodeFS.existsSync(settingsPathFor(baseDir)), false);
+    }),
+  );
+
+  it.effect("refuses a background for a theme this machine does not publish", () =>
+    Effect.gen(function* () {
+      const baseDir = makeBaseDir();
+      const clip = NodePath.join(baseDir, "clip.webm");
+      NodeFS.writeFileSync(clip, WEBM);
+
+      const failure = yield* runCli([
+        "theme",
+        "set",
+        "ocean",
+        "--background",
+        clip,
+        "--base-dir",
+        baseDir,
+      ]).pipe(Effect.flip);
+
+      assert.include(
+        String(failure),
+        'cannot go behind "ocean", which this machine does not publish',
+      );
+      assert.equal(NodeFS.existsSync(settingsPathFor(baseDir)), false);
+    }),
+  );
+
+  it.effect.skipIf(windowsHost)("puts the last background back when the theme fails to set", () =>
+    Effect.gen(function* () {
+      const baseDir = makeBaseDir();
+      writeSettings(baseDir, {});
+      const userdataDir = NodePath.dirname(settingsPathFor(baseDir));
+      const themesDir = NodePath.join(userdataDir, "themes");
+      NodeFS.mkdirSync(themesDir, { recursive: true });
+      NodeFS.writeFileSync(NodePath.join(themesDir, "nightfall.json"), NIGHTFALL_THEME_JSON);
+      NodeFS.writeFileSync(NodePath.join(themesDir, "nightfall.mp4"), MP4);
+      const clip = NodePath.join(baseDir, "clip.webm");
+      NodeFS.writeFileSync(clip, WEBM);
+
+      NodeFS.chmodSync(userdataDir, 0o555);
+      try {
+        yield* runCli([
+          "theme",
+          "set",
+          "nightfall",
+          "--background",
+          clip,
+          "--base-dir",
+          baseDir,
+        ]).pipe(Effect.flip);
+      } finally {
+        NodeFS.chmodSync(userdataDir, 0o755);
+      }
+      assert.deepEqual(NodeFS.readdirSync(themesDir).sort(), ["nightfall.json", "nightfall.mp4"]);
+      assert.deepEqual(NodeFS.readFileSync(NodePath.join(themesDir, "nightfall.mp4")), MP4);
     }),
   );
 
