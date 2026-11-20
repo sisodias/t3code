@@ -1,11 +1,14 @@
 // @effect-diagnostics nodeBuiltinImport:off - the guarded file read needs open
 // flags (O_NOFOLLOW, O_NONBLOCK) the FileSystem service does not expose.
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 
 import {
   type DefaultAppearancePreference,
   EnvironmentTheme,
+  type EnvironmentThemeBackgroundKind,
   type ServerSettingsError,
   EnvironmentThemeFile,
   EnvironmentThemeId,
@@ -61,8 +64,40 @@ export const MAX_THEME_FILE_BYTES = 6 * THEME_CSS_MAX_LENGTH + 16 * 1024;
 const MAX_THEME_TOTAL_BYTES = 2 * 1024 * 1024;
 
 /** A theme's background is `<id>.<extension>` beside `<id>.json`; earlier extensions win. */
-const THEME_BACKGROUND_EXTENSIONS = ["webp", "png", "jpg", "jpeg"] as const;
-const MAX_THEME_BACKGROUND_BYTES = 16 * 1024 * 1024;
+const THEME_BACKGROUND_EXTENSIONS = {
+  webm: "video",
+  mp4: "video",
+  webp: "image",
+  png: "image",
+  jpg: "image",
+  jpeg: "image",
+} as const satisfies Record<string, EnvironmentThemeBackgroundKind>;
+const THEME_BACKGROUND_FORMATS = {
+  "image/webp": "webp",
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "video/webm": "webm",
+  "video/mp4": "mp4",
+} as const;
+type ThemeBackgroundMimeType = keyof typeof THEME_BACKGROUND_FORMATS;
+export const MAX_THEME_BACKGROUND_BYTES = {
+  image: 16 * 1024 * 1024,
+  video: 64 * 1024 * 1024,
+} as const satisfies Record<EnvironmentThemeBackgroundKind, number>;
+const THEME_BACKGROUND_HEADER_BYTES = 64;
+// ISO media brands browsers play as MP4. HEIC and AVIF images share the box format but not these.
+const MP4_BRANDS = new Set([
+  "isom",
+  "iso2",
+  "iso4",
+  "iso5",
+  "iso6",
+  "mp41",
+  "mp42",
+  "avc1",
+  "dash",
+]);
+const THEME_BACKGROUND_FILES = "a JPEG, PNG, or WebP image, or a WebM or MP4 video";
 
 interface PublishedThemes {
   readonly seq: number;
@@ -124,13 +159,15 @@ export class EnvironmentThemeService extends Context.Service<
     /**
      * Makes `themeId` the environment theme and `appearance` its mode, so connected clients
      * switch to them. With `theme`, first publishes that file under the id, replacing one already
-     * there.
+     * there. With `background`, copies that image or video beside the theme as its background.
      */
     readonly apply: (
       input:
         | {
             readonly themeId: string;
             readonly theme?: EnvironmentThemeFile | undefined;
+            /** Absolute path of the file to copy. */
+            readonly background?: string | undefined;
             readonly appearance?: Exclude<DefaultAppearancePreference, ""> | undefined;
           }
         | { readonly appearance: Exclude<DefaultAppearancePreference, ""> },
@@ -151,19 +188,14 @@ const pathIsTaken = (filePath: string): boolean => {
   }
 };
 
-/** Validates and reads one handle; rejects symlinked files, allows symlinked directories.
- * Uses non-blocking opens against FIFOs; Windows lacks these flags and checks symlinks with lstat. */
-export const readThemeFileGuarded = (
-  filePath: string,
-  maxBytes: number,
-  onMissing?: () => void,
-): string | null => {
-  let fd: number;
+/** Rejects symlinked files, allows symlinked directories. Uses non-blocking opens against FIFOs;
+ * Windows lacks these flags and checks symlinks with lstat. */
+const openGuarded = (filePath: string, onMissing?: () => void): number | null => {
   try {
     if (NodeFS.constants.O_NOFOLLOW === undefined && NodeFS.lstatSync(filePath).isSymbolicLink()) {
       return null;
     }
-    fd = NodeFS.openSync(
+    return NodeFS.openSync(
       filePath,
       NodeFS.constants.O_RDONLY |
         (NodeFS.constants.O_NOFOLLOW ?? 0) |
@@ -173,6 +205,16 @@ export const readThemeFileGuarded = (
     if ((error as NodeJS.ErrnoException).code === "ENOENT") onMissing?.();
     return null;
   }
+};
+
+/** Validates and reads one handle with the guards of `openGuarded`. */
+export const readThemeFileGuarded = (
+  filePath: string,
+  maxBytes: number,
+  onMissing?: () => void,
+): string | null => {
+  const fd = openGuarded(filePath, onMissing);
+  if (fd === null) return null;
   try {
     const info = NodeFS.fstatSync(fd);
     if (!info.isFile() || info.size > maxBytes) return null;
@@ -192,34 +234,197 @@ export const readThemeFileGuarded = (
   }
 };
 
+/** The format a background file's first bytes show, whatever its name says. */
+export function sniffThemeBackground(header: Uint8Array): ThemeBackgroundMimeType | null {
+  const bytes = Buffer.from(header.buffer, header.byteOffset, header.byteLength);
+  const text = bytes.toString("latin1");
+  if (text.startsWith("\xff\xd8\xff")) return "image/jpeg";
+  if (text.startsWith("\x89PNG\r\n\x1a\n")) return "image/png";
+  if (text.startsWith("RIFF") && text.slice(8, 12) === "WEBP") return "image/webp";
+  // An EBML header whose DocType is webm, not another Matroska type.
+  if (text.startsWith("\x1a\x45\xdf\xa3") && text.includes("webm")) return "video/webm";
+  if (text.slice(4, 8) === "ftyp") {
+    // The ftyp box: size, "ftyp", major brand, minor version, then compatible brands.
+    const boxEnd = Math.min(bytes.length, bytes.readUInt32BE(0));
+    const brands = [text.slice(8, 12)];
+    for (let offset = 16; offset + 4 <= boxEnd; offset += 4) {
+      brands.push(text.slice(offset, offset + 4));
+    }
+    if (brands.some((brand) => MP4_BRANDS.has(brand))) return "video/mp4";
+  }
+  return null;
+}
+
+const describeKind = (kind: EnvironmentThemeBackgroundKind) =>
+  kind === "video" ? "a video" : "an image";
+
+/** Checks a background's bytes and size per kind, through the guards of `openGuarded`. */
+function inspectThemeBackground(filePath: string):
+  | {
+      readonly mimeType: ThemeBackgroundMimeType;
+      readonly kind: EnvironmentThemeBackgroundKind;
+      readonly info: NodeFS.BigIntStats;
+    }
+  | { readonly problem: string } {
+  const fd = openGuarded(filePath);
+  if (fd === null) return { problem: "could not be read, or is a symlink." };
+  try {
+    const info = NodeFS.fstatSync(fd, { bigint: true });
+    if (!info.isFile()) return { problem: "is not a file." };
+    const header = Buffer.alloc(THEME_BACKGROUND_HEADER_BYTES);
+    const read = NodeFS.readSync(fd, header, 0, header.length, 0);
+    const mimeType = sniffThemeBackground(header.subarray(0, read));
+    if (mimeType === null) return { problem: `is not ${THEME_BACKGROUND_FILES}.` };
+    const kind = mimeType.startsWith("video/") ? "video" : "image";
+    const limit = MAX_THEME_BACKGROUND_BYTES[kind];
+    if (info.size > BigInt(limit)) {
+      return {
+        problem: `is larger than ${limit / 1024 / 1024} MB, the limit for ${describeKind(kind)}.`,
+      };
+    }
+    return { mimeType, kind, info };
+  } catch {
+    return { problem: "could not be read." };
+  } finally {
+    NodeFS.closeSync(fd);
+  }
+}
+
 /**
- * The background image published beside `themeId`, if any. Symlinks and oversized files are
- * skipped. `entries` lets a directory scan skip lookups for names it did not list.
+ * The background published beside `themeId`, if any. Symlinks, oversized files, and files whose
+ * bytes are not the kind their extension names are skipped, and reported to `onSkip`. `entries`
+ * lets a directory scan skip lookups for names it did not list.
  */
 export function findThemeBackground(
   themesDir: string,
   themeId: string,
   entries?: ReadonlySet<string>,
-): { readonly path: string; readonly revision: string } | null {
-  for (const extension of THEME_BACKGROUND_EXTENSIONS) {
+  onSkip?: (path: string, problem: string) => void,
+): {
+  readonly path: string;
+  readonly revision: string;
+  readonly kind: EnvironmentThemeBackgroundKind;
+  readonly mimeType: ThemeBackgroundMimeType;
+} | null {
+  for (const [extension, kind] of Object.entries(THEME_BACKGROUND_EXTENSIONS)) {
     const name = `${themeId}.${extension}`;
     if (entries !== undefined && !entries.has(name)) continue;
     // Native separators: the asset route refuses a path that differs from its canonical form.
     const filePath = NodePath.join(themesDir, name);
-    let info: NodeFS.BigIntStats;
-    try {
-      info = NodeFS.lstatSync(filePath, { bigint: true });
-    } catch {
+    const file = inspectThemeBackground(filePath);
+    if ("problem" in file || file.kind !== kind) {
+      onSkip?.(
+        filePath,
+        "problem" in file
+          ? file.problem
+          : `holds ${describeKind(file.kind)}, but .${extension} is for ${describeKind(kind)}.`,
+      );
       continue;
     }
-    if (!info.isFile() || info.size > MAX_THEME_BACKGROUND_BYTES) continue;
     return {
       path: filePath,
-      revision: [info.ino, info.size, info.mtimeNs].map((part) => part.toString(36)).join("-"),
+      kind,
+      mimeType: file.mimeType,
+      revision: [file.info.ino, file.info.size, file.info.mtimeNs]
+        .map((part) => part.toString(36))
+        .join("-"),
     };
   }
   return null;
 }
+
+/** A file that cannot be a theme's background. `problem` ends the sentence naming the file. */
+export class ThemeBackgroundRefusedError extends Schema.TaggedError<ThemeBackgroundRefusedError>()(
+  "ThemeBackgroundRefusedError",
+  {
+    filePath: Schema.String,
+    problem: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return `${this.filePath} ${this.problem}`;
+  }
+}
+
+/**
+ * Copies the image or video at `sourcePath` beside `themeId` as its only background, named for
+ * what its bytes hold. Other backgrounds of the theme move aside: `commit` deletes them, and
+ * `revert` removes the copy and puts them back.
+ */
+export const stageThemeBackground = Effect.fn("EnvironmentTheme.stageBackground")(
+  function* (input: {
+    readonly themesDir: string;
+    readonly themeId: string;
+    readonly sourcePath: string;
+  }) {
+    const refuse = (problem: string, cause?: unknown) =>
+      new ThemeBackgroundRefusedError({
+        filePath: input.sourcePath,
+        problem,
+        ...(cause === undefined ? {} : { cause }),
+      });
+    if (!NodePath.isAbsolute(input.sourcePath)) {
+      return yield* refuse("is not an absolute path.");
+    }
+    const source = yield* Effect.tryPromise({
+      try: () => NodeFSP.realpath(input.sourcePath),
+      catch: (cause) => refuse("could not be read.", cause),
+    });
+    const file = inspectThemeBackground(source);
+    if ("problem" in file) return yield* refuse(file.problem);
+
+    const extension = THEME_BACKGROUND_FORMATS[file.mimeType];
+    const destination = NodePath.join(input.themesDir, `${input.themeId}.${extension}`);
+    // Neither name ends in a background extension, so readers never see them.
+    const staging = `${destination}.staging-${process.pid}`;
+    const moved: Array<readonly [from: string, to: string]> = [];
+    let stagedIno: bigint | undefined;
+    const revert = Effect.promise(async () => {
+      await NodeFSP.rm(staging, { force: true }).catch(() => {});
+      const current = await NodeFSP.lstat(destination, { bigint: true }).catch(() => null);
+      if (current !== null && current.ino === stagedIno) {
+        await NodeFSP.unlink(destination).catch(() => {});
+      }
+      for (const [from, to] of moved.toReversed()) await NodeFSP.rename(to, from).catch(() => {});
+    });
+    const commit = Effect.promise(() =>
+      Promise.all(moved.map(([, to]) => NodeFSP.rm(to, { force: true }).catch(() => {}))),
+    ).pipe(Effect.asVoid);
+
+    const copy = (step: () => Promise<void>) =>
+      Effect.tryPromise({
+        try: step,
+        catch: (cause) => refuse(`could not be copied into ${input.themesDir}.`, cause),
+      }).pipe(Effect.tapError(() => revert));
+
+    yield* copy(async () => {
+      await NodeFSP.mkdir(input.themesDir, { recursive: true });
+      await NodeFSP.rm(staging, { force: true });
+      // Exclusive create: a link left at the staging path is never written through.
+      await NodeFSP.copyFile(source, staging, NodeFS.constants.COPYFILE_EXCL);
+      stagedIno = (await NodeFSP.lstat(staging, { bigint: true })).ino;
+    });
+    // The source can change after its check; the copy is what clients will be served.
+    const copied = inspectThemeBackground(staging);
+    if ("problem" in copied || copied.mimeType !== file.mimeType) {
+      yield* revert;
+      return yield* refuse("changed while it was being copied.");
+    }
+    yield* copy(async () => {
+      for (const other of Object.keys(THEME_BACKGROUND_EXTENSIONS)) {
+        const from = NodePath.join(input.themesDir, `${input.themeId}.${other}`);
+        const info = await NodeFSP.lstat(from).catch(() => null);
+        if (info === null || info.isDirectory()) continue;
+        const to = `${from}.rollback-${NodeCrypto.randomUUID()}`;
+        await NodeFSP.rename(from, to);
+        moved.push([from, to]);
+      }
+      await NodeFSP.rename(staging, destination);
+    });
+    return { kind: file.kind, revert, commit };
+  },
+);
 
 export const readPublishedThemes = Effect.fn(function* (
   themesDir: string,
@@ -289,8 +494,18 @@ export const readPublishedThemes = Effect.fn(function* (
       break;
     }
 
-    const background = findThemeBackground(themesDir, id, entryNames);
-    themes.push({ id, ...file, ...(background ? { background: background.revision } : {}) });
+    const skipped: Array<{ readonly path: string; readonly problem: string }> = [];
+    const background = findThemeBackground(themesDir, id, entryNames, (path, problem) =>
+      skipped.push({ path, problem }),
+    );
+    for (const skip of skipped) {
+      yield* Effect.logWarning("ignoring unusable environment theme background", skip);
+    }
+    themes.push({
+      id,
+      ...file,
+      ...(background ? { background: background.revision, backgroundKind: background.kind } : {}),
+    });
   }
   if (listedFileMissing) yield* onPathMissing;
   return themes;
@@ -447,6 +662,7 @@ const make = Effect.gen(function* () {
   )(function* (input) {
     const themeId = "themeId" in input ? input.themeId : undefined;
     const theme = "theme" in input ? input.theme : undefined;
+    const background = "background" in input ? input.background : undefined;
     const { appearance } = input;
     if (themeId !== undefined && !isEnvironmentThemeId(themeId)) {
       return yield* new EnvironmentThemeRefusedError({ themeId, problem: INVALID_ID });
@@ -467,12 +683,14 @@ const make = Effect.gen(function* () {
         .pipe(Effect.mapError((cause) => new EnvironmentThemeNotSelectedError({ themeId, cause })));
     });
     // One at a time, so a selection never sees a file that a failed publish then takes back.
-    // If the theme cannot be selected, the file it replaced comes back.
+    // If the theme cannot be selected, the files it replaced come back.
     yield* publishSemaphore.withPermits(1)(
       Effect.gen(function* () {
         if (themeId === undefined) return yield* select;
+        let revert: Effect.Effect<void> = Effect.void;
         if (theme === undefined) {
-          const known = [...MOBILE_THEME_IDS, ...(yield* refresh).themes.map(({ id }) => id)];
+          const published = (yield* refresh).themes.map(({ id }) => id);
+          const known = [...MOBILE_THEME_IDS, ...published];
           if (!known.includes(themeId)) {
             return yield* new EnvironmentThemeRefusedError({
               themeId,
@@ -480,10 +698,35 @@ const make = Effect.gen(function* () {
               known,
             });
           }
-          return yield* select;
+          if (background !== undefined && !published.includes(themeId)) {
+            return yield* new EnvironmentThemeRefusedError({
+              themeId,
+              problem: "is built in and cannot have a background. Publish a theme to give it one.",
+            });
+          }
+        } else {
+          revert = yield* publish(themeId, theme);
         }
-        const revert = yield* publish(themeId, theme);
-        yield* select.pipe(Effect.tapError(() => revert));
+        if (background === undefined) return yield* select.pipe(Effect.tapError(() => revert));
+
+        const staged = yield* stageThemeBackground({
+          themesDir: environmentThemesDir,
+          themeId,
+          sourcePath: background,
+        }).pipe(
+          Effect.mapError(
+            (cause) =>
+              new EnvironmentThemeRefusedError({
+                themeId,
+                problem: `cannot use the background ${cause.filePath}, which ${cause.problem}`,
+                cause,
+              }),
+          ),
+          Effect.tapError(() => revert),
+        );
+        yield* select.pipe(Effect.tapError(() => staged.revert.pipe(Effect.andThen(revert))));
+        yield* staged.commit;
+        yield* refresh;
       }),
     );
   });
