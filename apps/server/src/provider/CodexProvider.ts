@@ -57,6 +57,7 @@ import {
   type CodexRateLimitSnapshot,
   type CodexResetCreditsSummary,
 } from "./codexUsageLimits.ts";
+import { readCodexPaidThrough } from "./codexPaidThrough.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import packageJson from "../../package.json" with { type: "json" };
 const isCodexAppServerSpawnError = Schema.is(CodexErrors.CodexAppServerSpawnError);
@@ -155,6 +156,7 @@ const CODEX_PRESENTATION = {
 } as const;
 
 export interface CodexAppServerProviderSnapshot {
+  readonly paidThrough?: string | undefined;
   readonly account: CodexSchema.V2GetAccountResponse;
   readonly endpoint?: string | undefined;
   readonly nativeUsage?: boolean;
@@ -808,9 +810,39 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
     { concurrency: "unbounded" },
   );
 
+  const account = accountResponse.account;
+  const environment = yield* codexProcessEnvironment(input);
+  const path = yield* Path.Path;
+  const configuredHome = path.resolve(
+    input.cwd,
+    environment.CODEX_HOME ||
+      (yield* HostProcess.Environment).CODEX_HOME ||
+      path.join(yield* HostProcess.HomeDirectory, ".codex"),
+  );
+  const livePlan =
+    rateLimits && "snapshot" in rateLimits ? rateLimits.snapshot.planType : undefined;
+  const paidThrough =
+    nativeUsage &&
+    account?.type === "chatgpt" &&
+    account.email &&
+    (!livePlan || livePlan === "unknown" || livePlan === account.planType) &&
+    initialize.codexHome === configuredHome
+      ? yield* withCodexDiscoveryDeadline(
+          readCodexPaidThrough(configuredHome, {
+            email: account.email,
+            planType: account.planType,
+            workspaceId:
+              rateLimits && "accountId" in rateLimits
+                ? (rateLimits.accountId ?? undefined)
+                : undefined,
+          }),
+          deadlineMs,
+        )
+      : undefined;
   const cyberAccess = Option.getOrUndefined(decodeCodexCyberAccessConfig(config));
   return {
     account: accountResponse,
+    ...(paidThrough ? { paidThrough } : {}),
     endpoint: config ? codexCustomEndpoint(config) : undefined,
     nativeUsage,
     ...(rateLimits ? { rateLimits } : {}),
@@ -970,7 +1002,7 @@ const makePendingCodexProvider = Effect.fn("CodexProvider.makePendingCodexProvid
 const quotePath = Schema.encodeSync(Schema.fromJsonString(Schema.String));
 
 function accountProbeStatus(
-  { account, rateLimits }: CodexAppServerProviderSnapshot,
+  { account, rateLimits, paidThrough }: CodexAppServerProviderSnapshot,
   codexHome: string | undefined,
 ): {
   readonly status: Exclude<ServerProviderState, "disabled">;
@@ -989,6 +1021,7 @@ function accountProbeStatus(
     ...(account.account?.type ? { type: account.account?.type } : {}),
     ...(authLabel ? { label: authLabel } : {}),
     ...(authEmail ? { email: authEmail } : {}),
+    ...(paidThrough ? { paidThrough } : {}),
     ...(workspaceId ? { workspaceId } : {}),
   } satisfies ServerProvider["auth"];
 
