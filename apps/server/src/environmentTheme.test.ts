@@ -557,6 +557,42 @@ describe("environment theme", () => {
     ),
   );
 
+  it.effect("serves a theme's live background page and skips one it may not load", () =>
+    withEnvironmentThemes(
+      {
+        "scene.json": encodeThemeFile({
+          ...NIGHTFALL_THEME,
+          backgroundPage: "https://scene.example/live?embed=1",
+        }),
+        "local.json": encodeThemeFile({
+          ...NIGHTFALL_THEME,
+          backgroundPage: "http://127.0.0.1:5173/scene",
+        }),
+        "plain-http.json": JSON.stringify({
+          ...NIGHTFALL_THEME,
+          backgroundPage: "http://scene.example/live",
+        }),
+        "script.json": JSON.stringify({
+          ...NIGHTFALL_THEME,
+          backgroundPage: "javascript:alert(1)",
+        }),
+        "credentials.json": JSON.stringify({
+          ...NIGHTFALL_THEME,
+          backgroundPage: "https://user:pass@scene.example/",
+        }),
+      },
+      Effect.gen(function* () {
+        assert.deepEqual(
+          (yield* currentThemes).map((theme) => [theme.id, theme.backgroundPage]),
+          [
+            ["local", "http://127.0.0.1:5173/scene"],
+            ["scene", "https://scene.example/live?embed=1"],
+          ],
+        );
+      }),
+    ),
+  );
+
   it.effect("puts the previous theme back when the new one cannot be selected", () =>
     withEnvironmentThemes(
       { [`${REFUSED_THEME_ID}.json`]: encodeThemeFile(NIGHTFALL_THEME) },

@@ -7,6 +7,7 @@ import { assetEnvironment } from "./state/assets";
 import { localEnvironmentIdAtom } from "./state/primaryEnvironment";
 import { themeServerEnvironmentThemesAtom } from "./state/server";
 import { environmentSession } from "./state/session";
+import { showThemeBackgroundPage } from "./themeBackgroundPage";
 import { playThemeBackgroundVideo } from "./themeBackgroundVideo";
 import { getCustomThemes } from "./themePalette";
 
@@ -20,6 +21,17 @@ let shownKey: string | null = null;
 let loading: AbortController | null = null;
 let objectUrl: string | null = null;
 let shownVideo: { readonly element: HTMLVideoElement; readonly stop: () => void } | null = null;
+let shownPage: { readonly key: string; readonly stop: () => void } | null = null;
+
+/** Shows the published theme's live background page, independently of its image or video. */
+function applyBackgroundPage(themeId: string | undefined, url: string | undefined): void {
+  const key = themeId === undefined || url === undefined ? null : JSON.stringify([themeId, url]);
+  if (key === (shownPage?.key ?? null)) return;
+  shownPage?.stop();
+  shownPage = null;
+  if (key === null || url === undefined) return;
+  shownPage = { key, stop: showThemeBackgroundPage(url, window) };
+}
 
 function clear(): void {
   document.documentElement.style.removeProperty(THEME_BACKGROUND_VARIABLE);
@@ -97,7 +109,8 @@ async function downloadImage(url: string, signal: AbortSignal): Promise<string |
 }
 
 /**
- * Shows the image or video published beside `themeId`, or clears it. An image becomes
+ * Shows the image or video published beside `themeId`, or clears it, and the theme's live
+ * background page if it names one (themeBackgroundPage.ts). An image becomes
  * `--theme-background-image`, copied into a blob URL once per revision so the signed URL may
  * expire. A video streams from its signed URL behind the app, and a new URL is minted if it fails.
  */
@@ -112,6 +125,7 @@ export function applyThemeBackground(themeId: string | undefined): void {
       : appAtomRegistry
           .get(themeServerEnvironmentThemesAtom)
           ?.find((theme) => theme.id === themeId);
+  applyBackgroundPage(themeId, published?.backgroundPage);
   const revision = published?.background;
   const kind = published?.backgroundKind ?? "image";
   const key =
@@ -184,5 +198,6 @@ export function startThemeBackground(): () => void {
     loading = null;
     shownKey = null;
     clear();
+    applyBackgroundPage(undefined, undefined);
   };
 }

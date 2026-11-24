@@ -172,3 +172,54 @@ makes a surface transparent or translucent, and the CSS can restyle the video it
 ```
 
 Delete the background file to remove it.
+
+### Live background page
+
+A video is a recording: it is only as sharp and smooth as the file. A theme can instead name a page
+that draws itself live, such as an animated scene, with `backgroundPage` in its file:
+
+```json
+{
+  "name": "Nightfall",
+  "appearance": "dark",
+  "canvas": "#1a1b26",
+  "accent": "#7aa2f7",
+  "backgroundPage": "https://scene.example/live?embed=1"
+}
+```
+
+The page must be https (or http on `localhost` or `127.0.0.1` while you develop it), and from
+another origin than T3 Code. It loads in a frame behind the whole app, which the browser runs in its
+own process, so its scripts do not hold up typing or scrolling. Its drawing shares the GPU with the
+app, though: a page that keeps the GPU busy makes every frame T3 Code draws, and so every keystroke,
+reach the screen later. Measure it on the slowest computer it will run on, and use a background video
+where it is too heavy. The frame is sandboxed: the page
+can run scripts and reach its own site, but it cannot open windows, navigate the app, or take
+clicks, keys, or focus. Under reduced motion no page loads.
+
+The page tells T3 Code it has drawn by posting a message to its parent:
+
+```js
+parent.postMessage({ type: "t3-background-page", state: "ready" }, "*");
+```
+
+Until then the root element's `data-theme-background-page` attribute is `loading` and the app's
+surfaces stay as they are, so a theme can keep a still background image as the fallback. A page that
+is not ready within 20 seconds is removed (`failed`) and tried again after 10 seconds, a minute, and
+then every five minutes, and at once when the computer comes back online. A window nobody can see may
+get no frames, so a page that waits to draw before it is ready can fail until the window is shown.
+Once the page is ready the attribute is
+`ready`, and the theme's CSS decides where it shows:
+
+```css
+html[data-theme-background-page="ready"] [data-slot="sidebar-inset"] {
+  --background: transparent;
+}
+html[data-theme-background-page="ready"] [data-workspace-area="conversation"] {
+  background: none;
+}
+```
+
+While the window is hidden, T3 Code posts `{ type: "t3-background-page", state: "paused" }` to the
+page, and `state: "running"` when it is shown again. The browser also stops a hidden window's
+animation frames on its own.
