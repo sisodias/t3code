@@ -178,6 +178,12 @@ def past_tips(patch_name):
     return tips
 
 
+def reflog_tips(branch):
+    """Earlier values of the fork's branch that this clone fetched."""
+    ref = f"refs/remotes/{STACK['fork']['remote']}/{branch}"
+    return git("reflog", "show", "--format=%H", ref, check=False).stdout.split()
+
+
 def upstream_merged(patch, nightly_commit, log):
     url = patch.get("upstream_pr")
     if not url:
@@ -216,12 +222,18 @@ def rebase_patch(patch, new_parent, old_parent, log):
 
 # ---------- the run ----------
 
-def plan(nightly, log):
+def plan(nightly, log, use=None):
     nightly_commit = out("rev-parse", nightly + "^{commit}")
     patches = []
     for spec in STACK["patches"]:
         patch = dict(spec)
         patch["source"] = remote_tip(patch["branch"])
+        patch["fork_tip"] = patch["source"]
+        if use and patch["name"] in use:
+            # A patch fixed by hand but not pushed yet: build from that ref; push replaces the fork's tip.
+            patch["source"] = out("rev-parse", use[patch["name"]] + "^{commit}")
+            log("patch", f"{patch['name']}: using {use[patch['name']]} ({patch['source'][:10]}) instead of the fork's "
+                         f"{(patch['fork_tip'] or 'missing')[:10]}")
         if patch["source"] is None:
             if patch.get("optional"):
                 log("patch", f"{patch['name']}: {patch['branch']} is not on the fork yet; skipped (optional)")
@@ -252,7 +264,8 @@ def rebase_stack(nightly, nightly_commit, patches, log):
             parent = by_name[base]
             new_parent, patch["onto_label"] = parent["tip"], f"{base} ({parent['branch']})"
             # Where it branched off the base patch: the newest of that patch's known tips it contains.
-            known = [parent["source"], *past_tips(base)]
+            known = [parent["source"], *([parent["fork_tip"]] if parent.get("fork_tip") else []),
+                     *reflog_tips(parent["branch"]), *past_tips(base)]
             inside = [t for t in dict.fromkeys(known) if is_ancestor(t, patch["source"])]
             if not inside:
                 raise Stop("patch_broke", f"patch {patch['name']} does not contain any known tip of {base} "
@@ -350,9 +363,10 @@ def push(nightly, nightly_commit, build_commit, version, kept, dropped, log):
     remote = STACK["fork"]["remote"]
     failures = []
     for patch in kept:
-        if patch["tip"] == patch["source"]:
+        if patch["tip"] == patch.get("fork_tip"):
             continue
-        done = git("push", f"--force-with-lease=refs/heads/{patch['branch']}:{patch['source']}", remote,
+        lease = patch.get("fork_tip") or ""
+        done = git("push", f"--force-with-lease=refs/heads/{patch['branch']}:{lease}", remote,
                    f"{WORK}{patch['name']}:refs/heads/{patch['branch']}", check=False, log=log)
         if done.returncode != 0:
             failures.append(f"{patch['branch']} (it moved on the fork since this run read it)")
@@ -430,7 +444,8 @@ def cmd_run(args):
         git("fetch", "--quiet", STACK["upstream"]["remote"], "--tags", log=log)
         nightly = args.nightly or newest_nightly()
         version = nightly[1:]
-        nightly_commit, patches, key = plan(nightly, log)
+        use = dict(item.split("=", 1) for item in args.use)
+        nightly_commit, patches, key = plan(nightly, log, use)
         result.update(nightly=nightly, key=key, patches={p["name"]: p["source"] for p in patches})
         log("plan", f"{nightly} ({nightly_commit[:12]}); patches " +
             ", ".join(f"{p['name']} {p['source'][:10]}" for p in patches) + f"; key {key}")
@@ -532,6 +547,8 @@ def main():
     run.add_argument("--no-switch", action="store_true", help="build, but do not arm the switch")
     run.add_argument("--no-push", action="store_true", help="do not push branches or tags to the fork")
     run.add_argument("--force", action="store_true", help="run even if these inputs were already built or failed")
+    run.add_argument("--use", action="append", default=[], metavar="NAME=REF",
+                     help="build patch NAME from local REF (a fix not pushed yet); push then replaces the fork's branch")
     run.add_argument("--wake", help="thread for the result and the switch's report (default stack.json notify_thread)")
     trigger = sub.add_parser("trigger")
     trigger.add_argument("--offered", required=True)
