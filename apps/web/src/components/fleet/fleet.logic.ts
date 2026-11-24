@@ -1,4 +1,9 @@
-import type { EnvironmentId, PeerLinkThreadSummary, ThreadId } from "@t3tools/contracts";
+import type {
+  EnvironmentId,
+  OrchestrationV2ThreadLine,
+  PeerLinkThreadSummary,
+  ThreadId,
+} from "@t3tools/contracts";
 
 import type { SidebarThreadSummary } from "../../types";
 import { resolveSidebarRowStatus } from "../Sidebar.logic";
@@ -17,6 +22,12 @@ export type FleetAttention =
 export type FleetActivity = "preparing" | "working" | "waiting" | "idle";
 
 export type FleetThreadKind = "owner" | "lane" | "helper";
+
+/** One line under a row: what its agent last said or was asked, or why its run stopped. */
+export type FleetLine =
+  | { readonly kind: "said" | "asked" | "stopped"; readonly text: string }
+  /** A plan's usage limit stopped the run until then. */
+  | { readonly kind: "resets"; readonly at: string };
 
 export interface FleetThreadRef {
   readonly environmentId: EnvironmentId;
@@ -45,6 +56,11 @@ export interface FleetThread extends FleetThreadRef {
   readonly settled: boolean;
   readonly backgroundTaskCount: number;
   readonly updatedAt: string;
+  /**
+   * Why its run stopped, or what it last said when its machine's list says. A connected
+   * machine's messages are read for the rows on show; see `fleetLine`.
+   */
+  readonly line: FleetLine | null;
 }
 
 /** How this client reaches a machine: connected to it, or through another machine's link. */
@@ -122,6 +138,29 @@ const ATTENTION_ORDER: Record<FleetAttention, number> = {
 };
 
 const fleetThreadKey = (ref: FleetThreadRef) => `${ref.environmentId}\n${ref.threadId}`;
+
+/** Markdown an agent writes, as the plain words a one-line row can show. */
+export function plainLine(text: string): string {
+  return text
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/(\*\*|__|`)/g, "")
+    .replace(/(^|\s)#{1,6}\s+/g, "$1")
+    .replace(/(^|\s)[-*+>]\s+/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const messageLine = (message: OrchestrationV2ThreadLine): FleetLine | null => {
+  const text = plainLine(message.text);
+  if (text === "") return null;
+  return { kind: message.author === "user" ? "asked" : "said", text };
+};
+
+/** The row's line: why its run stopped when known, else the message read for it. */
+export const fleetLine = (
+  thread: FleetThread,
+  message: OrchestrationV2ThreadLine | undefined,
+): FleetLine | null => thread.line ?? (message === undefined ? null : messageLine(message));
 
 const isUnderWay = (thread: FleetThread) => thread.activity !== "idle";
 
@@ -388,6 +427,14 @@ export function fleetThreadFromShell(shell: LocalShell): FleetThread {
               ["queued", "starting", "running", "waiting"].includes(shell.runtime.status)
             ? "working"
             : "idle";
+  const lastError = plainLine(shell.runtime?.lastError ?? "");
+  const resetsAt = shell.runtime?.usageLimitResetAt ?? null;
+  const line: FleetLine | null =
+    attention === "limit" && resetsAt !== null
+      ? { kind: "resets", at: resetsAt }
+      : (attention === "limit" || attention === "stopped") && lastError !== ""
+        ? { kind: "stopped", text: lastError }
+        : null;
   return {
     environmentId: shell.environmentId,
     threadId: shell.id,
@@ -412,6 +459,7 @@ export function fleetThreadFromShell(shell: LocalShell): FleetThread {
     settled: shell.settledOverride === "settled" || shell.settledAt !== null,
     backgroundTaskCount: shell.pendingBackgroundTasks?.length ?? 0,
     updatedAt: shell.updatedAt,
+    line,
   };
 }
 
@@ -421,11 +469,23 @@ export function fleetThreadFromLinked(
   summary: PeerLinkThreadSummary,
 ): FleetThread {
   const asks = (summary.pendingRequestCount ?? 0) > 0;
+  const stop = summary.status === "failed" ? (summary.stop ?? null) : null;
+  // Like a connected machine's, a plan limit stays named after the chat is settled.
+  const limited = stop?.usageLimit === true;
   const attention: FleetAttention | null = asks
     ? "request"
-    : summary.status === "failed" && !summary.settled
-      ? "stopped"
-      : null;
+    : limited
+      ? "limit"
+      : summary.status === "failed" && !summary.settled
+        ? "stopped"
+        : null;
+  const said = summary.latestMessage === undefined ? null : messageLine(summary.latestMessage);
+  const stopped: FleetLine | null =
+    stop === null || plainLine(stop.message) === ""
+      ? null
+      : { kind: "stopped", text: plainLine(stop.message) };
+  // A limited agent's last words usually say when the plan resets; the error only that it stopped.
+  const line = limited ? (said ?? stopped) : (stopped ?? said);
   const activity: FleetActivity =
     summary.status === "preparing"
       ? "preparing"
@@ -456,5 +516,6 @@ export function fleetThreadFromLinked(
     settled: summary.settled,
     backgroundTaskCount: summary.backgroundTaskCount,
     updatedAt: summary.updatedAt,
+    line,
   };
 }

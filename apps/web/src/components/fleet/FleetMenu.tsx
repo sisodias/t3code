@@ -14,10 +14,11 @@ import {
 import { useState } from "react";
 
 import { useNowMinute } from "../../hooks/useNowMinute";
+import { usePrimarySettings } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
 import { linkedThreadRouteParams } from "../../linkedThreadSurface";
 import { buildThreadRouteParams } from "../../threadRoutes";
-import { formatRelativeTimeLabel } from "../../timestampFormat";
+import { formatRelativeTimeLabel, formatUpcomingTimestamp } from "../../timestampFormat";
 import { Button } from "../ui/button";
 import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "../ui/popover";
 import {
@@ -31,7 +32,7 @@ import {
   type FleetReach,
   type FleetThread,
 } from "./fleet.logic";
-import { useFleetMachines } from "./useFleet";
+import { useFleetLine, useFleetMachines } from "./useFleet";
 
 type Gt = ReturnType<typeof useGT>;
 
@@ -174,10 +175,52 @@ function ThreadMeta({
   );
 }
 
+/** What the agent is doing or last said, or why it stopped; the whole note is in its chat. */
+function ThreadLine({
+  thread,
+  reach,
+  nowMs,
+}: {
+  readonly thread: FleetThread;
+  readonly reach: FleetReach | undefined;
+  readonly nowMs: number;
+}) {
+  const gt = useGT();
+  const resolve = useMessages();
+  const timestampFormat = usePrimarySettings((settings) => settings.timestampFormat);
+  const line = useFleetLine(thread, reach);
+  if (line === null) return null;
+  const text =
+    line.kind === "asked"
+      ? gt("Asked: {text}", {
+          text: line.text,
+          $context: "the latest message a person or another agent sent this agent",
+        })
+      : line.kind === "resets"
+        ? gt("Plan resets {time}", {
+            time: formatUpcomingTimestamp(line.at, timestampFormat, nowMs, undefined, resolve),
+          })
+        : line.text;
+  return (
+    <span
+      className={cn(
+        "min-w-0 truncate text-xs",
+        line.kind === "said" || line.kind === "asked"
+          ? "text-muted-foreground"
+          : "text-destructive",
+      )}
+      data-fleet-line={line.kind}
+    >
+      {text}
+    </span>
+  );
+}
+
 function NodeRow({
   node,
   ownerMachine,
   labelById,
+  reachById,
   expanded,
   onToggle,
   onOpen,
@@ -186,6 +229,7 @@ function NodeRow({
   readonly node: FleetNode;
   readonly ownerMachine: EnvironmentId;
   readonly labelById: ReadonlyMap<EnvironmentId, string>;
+  readonly reachById: ReadonlyMap<EnvironmentId, FleetReach>;
   readonly expanded: ReadonlySet<string>;
   readonly onToggle: (key: string) => void;
   readonly onOpen: (thread: FleetThread) => void;
@@ -255,6 +299,7 @@ function NodeRow({
               <StatusChip thread={thread} />
             </span>
           </span>
+          <ThreadLine nowMs={nowMs} reach={reachById.get(thread.environmentId)} thread={thread} />
           <span className="flex min-w-0 items-center gap-2">
             <ThreadMeta machineLabel={machineLabel} nowMs={nowMs} thread={thread} />
             {under.length > 0 ? (
@@ -273,6 +318,7 @@ function NodeRow({
               key={child.key}
               labelById={labelById}
               node={child}
+              reachById={reachById}
               nowMs={nowMs}
               onOpen={onOpen}
               onToggle={onToggle}
@@ -298,6 +344,7 @@ function NodeRow({
 function MachineSection({
   machine,
   labelById,
+  reachById,
   expanded,
   onToggle,
   onOpen,
@@ -305,6 +352,7 @@ function MachineSection({
 }: {
   readonly machine: FleetMachineView;
   readonly labelById: ReadonlyMap<EnvironmentId, string>;
+  readonly reachById: ReadonlyMap<EnvironmentId, FleetReach>;
   readonly expanded: ReadonlySet<string>;
   readonly onToggle: (key: string) => void;
   readonly onOpen: (thread: FleetThread) => void;
@@ -368,6 +416,7 @@ function MachineSection({
               key={node.key}
               labelById={labelById}
               node={node}
+              reachById={reachById}
               nowMs={nowMs}
               onOpen={onOpen}
               onToggle={onToggle}
@@ -458,6 +507,11 @@ function FleetPanel({
                         <StatusChip thread={row.thread} />
                       </span>
                     </span>
+                    <ThreadLine
+                      nowMs={nowMs}
+                      reach={reachById.get(row.thread.environmentId)}
+                      thread={row.thread}
+                    />
                     <span className="flex min-w-0 items-center gap-2">
                       <ThreadMeta
                         machineLabel={row.machineLabel}
@@ -482,6 +536,7 @@ function FleetPanel({
             key={machine.environmentId}
             labelById={labelById}
             machine={machine}
+            reachById={reachById}
             nowMs={nowMs}
             onOpen={open}
             onToggle={toggle}

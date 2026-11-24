@@ -5870,6 +5870,8 @@
   "6d4394f5647ca381": "Guest message",
   "cae5581e4ed1e935": "Plan limit hit",
   "0e84676a88cfe194": "Stopped",
+  "400451abff88cf9d": "Preguntó: {text}",
+  "8e83d1ea66c0b3c7": "El plan se restablece {time}",
   "009006dd9588d78a": "{count, plural, one {{count} lane} other {{count} lanes}}",
   "eba52f45b61478f8": "{count, plural, one {{count} helper} other {{count} helpers}}",
   "7de41a3c2c89aafa": "{count} working under it",

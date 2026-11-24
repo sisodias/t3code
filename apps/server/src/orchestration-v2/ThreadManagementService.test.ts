@@ -34,6 +34,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import type { ProjectionTimelinePage } from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
@@ -1299,3 +1300,59 @@ it.effect(
       }).pipe(Effect.provide(layerTest));
     }),
 );
+
+it.effect("reads each thread's newest message as one line, for the rows a fleet shows", () => {
+  const asked: Array<{ threadId: string; options: unknown }> = [];
+  const newest: Record<string, unknown> = {
+    asks: { type: "user_message", text: "Tidy the docs" },
+    says: { type: "assistant_message", text: `Checking  the\n\nchangelog ${"x".repeat(400)}` },
+    plans: { type: "proposed_plan", markdown: "## Plan\n\n```sh\n1. Bump the version" },
+    blank: { type: "assistant_message", text: "   " },
+  };
+  const layerTest = ThreadManagementService.layer.pipe(
+    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+    Layer.provide(
+      Layer.mock(Orchestrator.OrchestratorV2)({
+        getTimelinePage: (threadId, options) => {
+          asked.push({ threadId, options });
+          if (threadId === "gone") {
+            return Effect.fail(
+              new Orchestrator.OrchestratorProjectionError({ threadId, cause: "" }),
+            );
+          }
+          const item = newest[threadId];
+          return Effect.succeed({
+            items: item === undefined ? [] : [{ item }],
+            totalItems: item === undefined ? 0 : 1,
+            hasMore: false,
+            hasEarlier: false,
+          } as unknown as ProjectionTimelinePage);
+        },
+      }),
+    ),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(layerReceiptsTest),
+  );
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    const lines = yield* threads.getThreadLines(
+      ["asks", "says", "plans", "blank", "empty", "gone"].map((id) => ThreadId.make(id)),
+    );
+    expect(Object.keys(lines).toSorted()).toEqual(["asks", "plans", "says"]);
+    expect(lines[ThreadId.make("asks")]).toEqual({ author: "user", text: "Tidy the docs" });
+    expect(lines[ThreadId.make("plans")]).toEqual({
+      author: "agent",
+      text: "Plan: 1. Bump the version",
+    });
+    const said = lines[ThreadId.make("says")];
+    expect(said?.author).toBe("agent");
+    expect(said?.text).toMatch(/^Checking the changelog x+$/);
+    expect(said?.text).toHaveLength(160);
+    // One newest message per thread, from the same view a thread read shows.
+    expect(asked[0]?.options).toEqual({
+      beforePosition: Number.POSITIVE_INFINITY,
+      limit: 1,
+      view: "messages",
+    });
+  }).pipe(Effect.provide(layerTest));
+});
