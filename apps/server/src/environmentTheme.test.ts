@@ -30,6 +30,40 @@ const encodeThemeFileEscaped = (theme: EnvironmentThemeFile) =>
     (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
   );
 
+const latin1 = (text: string) => Buffer.from(text, "latin1");
+/** An ftyp box: size, "ftyp", major brand, minor version, then compatible brands. */
+const ftyp = (major: string, ...compatible: ReadonlyArray<string>) => {
+  const box = latin1(`\0\0\0\0ftyp${major}\0\0\x02\0${compatible.join("")}`);
+  box.writeUInt32BE(box.length, 0);
+  return box;
+};
+/** An EBML header as ffmpeg writes it: versions and lengths, then DocType and its versions. */
+const ebml = (docType: string, docTypeVersion: number) =>
+  Buffer.concat([
+    Buffer.from("1a45dfa3", "hex"),
+    Buffer.from([0x80 | (27 + docType.length)]),
+    Buffer.from("4286810142f7810142f2810442f381084282", "hex"),
+    Buffer.from([0x80 | docType.length]),
+    latin1(docType),
+    Buffer.from([0x42, 0x87, 0x81, docTypeVersion, 0x42, 0x85, 0x81, 0x02]),
+  ]);
+/** The first bytes of each format; the rest of a file is zeros. */
+const HEADERS = {
+  png: latin1("\x89PNG\r\n\x1a\n\0\0\0\rIHDR"),
+  jpeg: latin1("\xff\xd8\xff\xe0\0\x10JFIF\0"),
+  webp: latin1("RIFF$\0\0\0WEBPVP8 "),
+  webm: ebml("webm", 2),
+  mp4: ftyp("isom", "isom", "iso2", "avc1", "mp41"),
+  mkv: ebml("matroska", 4),
+  // Not every browser shows HEIC, though its box is the one MP4 uses.
+  heic: ftyp("heic", "mif1", "heic"),
+};
+const media = (header: Uint8Array, size = 256) => {
+  const bytes = new Uint8Array(size);
+  bytes.set(header);
+  return bytes;
+};
+
 const NIGHTFALL_THEME: EnvironmentThemeFile = {
   name: "Nightfall",
   appearance: "dark",
@@ -48,7 +82,7 @@ const SHARED_THEME: EnvironmentThemeFile = {
 const REFUSED_THEME_ID = "refused";
 
 const withEnvironmentThemes = <A, E>(
-  seeds: Readonly<Record<string, string>>,
+  seeds: Readonly<Record<string, string | Uint8Array>>,
   body: Effect.Effect<
     A,
     E,
@@ -71,7 +105,10 @@ const withEnvironmentThemes = <A, E>(
     const themesDir = path.join(baseDir, "userdata", "themes");
     yield* fs.makeDirectory(themesDir, { recursive: true });
     for (const [filename, contents] of Object.entries(seeds)) {
-      yield* fs.writeFileString(path.join(themesDir, filename), contents);
+      const filePath = path.join(themesDir, filename);
+      yield* typeof contents === "string"
+        ? fs.writeFileString(filePath, contents)
+        : fs.writeFile(filePath, contents);
     }
 
     return yield* body.pipe(
@@ -656,33 +693,240 @@ describe("environment theme", () => {
     );
   });
 
+  it("recognises a background by its bytes, whatever its name", () => {
+    assert.deepEqual(
+      Object.fromEntries(
+        Object.entries(HEADERS).map(([format, header]) => [
+          format,
+          EnvironmentTheme.sniffThemeBackground(media(header)),
+        ]),
+      ),
+      {
+        png: "image/png",
+        jpeg: "image/jpeg",
+        webp: "image/webp",
+        webm: "video/webm",
+        mp4: "video/mp4",
+        mkv: null,
+        heic: null,
+      },
+    );
+    assert.isNull(EnvironmentTheme.sniffThemeBackground(latin1("<svg onload=alert(1)>")));
+    assert.isNull(EnvironmentTheme.sniffThemeBackground(new Uint8Array()));
+  });
+
   it.effect(
-    "reports the image beside a theme as its background, with a new revision per file",
+    "reports the image or video beside a theme as its background, with a new revision per file",
     () =>
       withEnvironmentThemes(
-        { "look.json": encodeThemeFile(NIGHTFALL_THEME), "look.png": "first" },
+        { "look.json": encodeThemeFile(NIGHTFALL_THEME), "look.png": media(HEADERS.png) },
         Effect.gen(function* () {
           const { environmentThemesDir } = yield* ServerConfig.ServerConfig;
           const fs = yield* FileSystem.FileSystem;
           const path = yield* Path.Path;
-          const background = Effect.map(currentThemes, (themes) => themes[0]?.background);
+          const background = Effect.map(currentThemes, ([theme]) => ({
+            revision: theme?.background,
+            kind: theme?.backgroundKind,
+          }));
           const image = path.join(environmentThemesDir, "look.png");
+          const video = path.join(environmentThemesDir, "look.webm");
 
           const first = yield* background;
-          assert.isDefined(first);
-          yield* fs.writeFileString(image, "a longer second image");
-          assert.notStrictEqual(yield* background, first);
+          assert.isDefined(first.revision);
+          assert.strictEqual(first.kind, "image");
+          yield* fs.writeFile(image, media(HEADERS.png, 512));
+          assert.notStrictEqual((yield* background).revision, first.revision);
+
+          yield* fs.writeFile(video, media(HEADERS.webm));
+          assert.strictEqual((yield* background).kind, "video");
+          yield* fs.remove(video);
 
           yield* fs.remove(image);
-          assert.isUndefined(yield* background);
+          assert.deepEqual(yield* background, { revision: undefined, kind: undefined });
           if (symlinksSupported) {
             const outside = path.join(environmentThemesDir, "..", "outside.png");
-            yield* fs.writeFileString(outside, "outside");
+            yield* fs.writeFile(outside, media(HEADERS.png));
             yield* fs.symlink(outside, image);
-            assert.isUndefined(yield* background);
+            assert.deepEqual(yield* background, { revision: undefined, kind: undefined });
           }
         }),
       ),
+  );
+
+  it.effect("skips a background whose bytes or size do not fit what its name says", () =>
+    withEnvironmentThemes(
+      {
+        "look.json": encodeThemeFile(NIGHTFALL_THEME),
+        "look.webm": media(HEADERS.png),
+        "look.mp4": media(HEADERS.mkv),
+        "look.png": "<svg onload=alert(1)>",
+        "look.jpg": media(HEADERS.jpeg),
+      },
+      Effect.gen(function* () {
+        const { environmentThemesDir } = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const kind = Effect.map(currentThemes, ([theme]) => theme?.backgroundKind);
+        // Sparse, so the large sizes take no disk.
+        const resize = (name: string, size: number) =>
+          fs.truncate(path.join(environmentThemesDir, name), size);
+        const { image: imageLimit, video: videoLimit } =
+          EnvironmentTheme.MAX_THEME_BACKGROUND_BYTES;
+
+        assert.strictEqual(yield* kind, "image");
+        yield* resize("look.jpg", imageLimit + 1);
+        assert.isUndefined(yield* kind);
+
+        yield* fs.writeFile(path.join(environmentThemesDir, "look.mp4"), media(HEADERS.mp4));
+        yield* resize("look.mp4", imageLimit + 1);
+        assert.strictEqual(yield* kind, "video");
+        yield* resize("look.mp4", videoLimit + 1);
+        assert.isUndefined(yield* kind);
+        yield* resize("look.mp4", videoLimit);
+        assert.strictEqual(yield* kind, "video");
+      }),
+    ),
+  );
+
+  it.effect("copies an image or video beside a theme as its only background", () =>
+    withEnvironmentThemes(
+      {},
+      Effect.gen(function* () {
+        const { environmentThemesDir } = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const themes = yield* EnvironmentTheme.EnvironmentThemeService;
+        const sources = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-theme-sources-" });
+        const clip = media(HEADERS.webm, 4096);
+        const video = path.join(sources, "clip.bin");
+        yield* fs.writeFile(video, clip);
+
+        // The copy is named for what its bytes hold, not for the source's name.
+        yield* themes.apply({ themeId: "look", theme: NIGHTFALL_THEME, background: video });
+        const [published] = yield* themes.current;
+        assert.strictEqual(published?.backgroundKind, "video");
+        assert.isDefined(published?.background);
+        assert.deepEqual(
+          new Uint8Array(yield* fs.readFile(path.join(environmentThemesDir, "look.webm"))),
+          clip,
+        );
+
+        // A published theme takes a new background without its file, which replaces the last.
+        const image = path.join(sources, "photo.jpeg");
+        yield* fs.writeFile(image, media(HEADERS.jpeg));
+        yield* themes.apply({ themeId: "look", background: image });
+        assert.strictEqual((yield* themes.current)[0]?.backgroundKind, "image");
+        assert.deepEqual((yield* fs.readDirectory(environmentThemesDir)).toSorted(), [
+          "look.jpg",
+          "look.json",
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("refuses a background that is not a usable image or video, and keeps the last", () =>
+    withEnvironmentThemes(
+      { "look.json": encodeThemeFile(NIGHTFALL_THEME), "look.png": media(HEADERS.png) },
+      Effect.gen(function* () {
+        const { environmentThemesDir } = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const themes = yield* EnvironmentTheme.EnvironmentThemeService;
+        const sources = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-theme-sources-" });
+        const source = (name: string, bytes: Uint8Array, size?: number) =>
+          Effect.gen(function* () {
+            const filePath = path.join(sources, name);
+            yield* fs.writeFile(filePath, bytes);
+            if (size !== undefined) yield* fs.truncate(filePath, size);
+            return filePath;
+          });
+        const refusal = (input: Parameters<typeof themes.apply>[0]) =>
+          themes.apply(input).pipe(
+            Effect.flip,
+            Effect.map((error) => error.message),
+          );
+        const { image: imageLimit, video: videoLimit } =
+          EnvironmentTheme.MAX_THEME_BACKGROUND_BYTES;
+
+        const notes = yield* source("notes.webm", latin1("only text"));
+        assert.match(
+          yield* refusal({ themeId: "look", background: notes }),
+          /notes\.webm, which is not a JPEG, PNG, or WebP image, or a WebM or MP4 video\.$/,
+        );
+        const matroska = yield* source("clip.mkv", media(HEADERS.mkv));
+        assert.match(yield* refusal({ themeId: "look", background: matroska }), /is not a JPEG/);
+        const longVideo = yield* source("long.mp4", media(HEADERS.mp4), videoLimit + 1);
+        assert.match(
+          yield* refusal({ themeId: "look", background: longVideo }),
+          /is larger than 64 MB, the limit for a video\.$/,
+        );
+        const largeImage = yield* source("large.png", media(HEADERS.png), imageLimit + 1);
+        assert.match(
+          yield* refusal({ themeId: "look", background: largeImage }),
+          /is larger than 16 MB, the limit for an image\.$/,
+        );
+        assert.match(
+          yield* refusal({ themeId: "look", background: "clip.webm" }),
+          /is not an absolute path\.$/,
+        );
+        assert.match(
+          yield* refusal({ themeId: "look", background: path.join(sources, "missing.webm") }),
+          /could not be read\.$/,
+        );
+        const clip = yield* source("clip.webm", media(HEADERS.webm));
+        assert.match(
+          yield* refusal({ themeId: "grove", background: clip }),
+          /is built in and cannot have a background/,
+        );
+        // A theme published with a refused background is taken back.
+        assert.match(
+          yield* refusal({ themeId: "fresh", theme: SHARED_THEME, background: notes }),
+          /is not a JPEG/,
+        );
+
+        assert.deepEqual(
+          (yield* themes.current).map((theme) => [theme.id, theme.backgroundKind]),
+          [["look", "image"]],
+        );
+        assert.deepEqual((yield* fs.readDirectory(environmentThemesDir)).toSorted(), [
+          "look.json",
+          "look.png",
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("puts the previous background back when the theme cannot be selected", () =>
+    withEnvironmentThemes(
+      {
+        [`${REFUSED_THEME_ID}.json`]: encodeThemeFile(NIGHTFALL_THEME),
+        [`${REFUSED_THEME_ID}.png`]: media(HEADERS.png),
+      },
+      Effect.gen(function* () {
+        const { environmentThemesDir } = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const themes = yield* EnvironmentTheme.EnvironmentThemeService;
+        const sources = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-theme-sources-" });
+        const video = path.join(sources, "clip.webm");
+        yield* fs.writeFile(video, media(HEADERS.webm));
+
+        const refused = yield* themes
+          .apply({
+            themeId: REFUSED_THEME_ID,
+            theme: { ...NIGHTFALL_THEME, name: "Changed" },
+            background: video,
+          })
+          .pipe(Effect.flip);
+        assert.strictEqual(refused._tag, "EnvironmentThemeNotSelectedError");
+        const [restored] = yield* themes.current;
+        assert.deepEqual([restored?.name, restored?.backgroundKind], ["Nightfall", "image"]);
+        assert.deepEqual((yield* fs.readDirectory(environmentThemesDir)).toSorted(), [
+          `${REFUSED_THEME_ID}.json`,
+          `${REFUSED_THEME_ID}.png`,
+        ]);
+      }),
+    ),
   );
 
   it.effect("keeps the served theme when an update does not fit the size limit", () => {

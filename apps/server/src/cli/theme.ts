@@ -28,6 +28,8 @@ import {
   MAX_THEME_FILE_BYTES,
   readPublishedThemes,
   readThemeFileGuarded,
+  stageThemeBackground,
+  ThemeBackgroundRefusedError,
 } from "../environmentTheme.ts";
 import { expandHomePath, resolveBaseDir } from "../os-jank.ts";
 import { isProcessAlive, readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
@@ -444,6 +446,12 @@ const themeSetCommand = Command.make("set", {
     Flag.withDescription("Theme id to publish a file under, instead of its filename."),
     Flag.optional,
   ),
+  background: Flag.String("background").pipe(
+    Flag.withDescription(
+      "A JPEG, PNG, or WebP image up to 16 MB, or a WebM or MP4 video up to 64 MB, to copy beside a published theme as its background. It replaces the theme's previous background.",
+    ),
+    Flag.optional,
+  ),
   theme: Argument.String("theme").pipe(
     Argument.withDescription(
       'A theme id (a built-in, or one this machine publishes, where themes/nightfall.json is "nightfall"), or a path to a theme JSON file to publish and set in one step.',
@@ -506,15 +514,42 @@ const themeSetCommand = Command.make("set", {
         return yield* new ThemeIdInvalidError({ themeId: target });
       }
 
+      let revertBackground: Effect.Effect<void> = Effect.void;
+      let commitBackground: Effect.Effect<void> = Effect.void;
+      let backgroundNote: string | undefined;
+      if (Option.isSome(flags.background)) {
+        const path = yield* Path.Path;
+        const sourcePath = path.resolve(yield* expandHomePath(flags.background.value.trim()));
+        const published =
+          targetIsFile ||
+          (yield* readPublishedThemes(paths.themesDir)).some((theme) => theme.id === themeId);
+        if (!published) {
+          return yield* new ThemeBackgroundRefusedError({
+            filePath: sourcePath,
+            problem: `cannot go behind "${themeId}", which this machine does not publish. Publish a theme file to give it a background.`,
+          });
+        }
+        const staged = yield* stageThemeBackground({
+          themesDir: paths.themesDir,
+          themeId,
+          sourcePath,
+        }).pipe(Effect.onError(() => revertPublish));
+        revertBackground = staged.revert;
+        commitBackground = staged.commit;
+        backgroundNote = `Its background is the ${staged.kind} ${sourcePath}.\n`;
+      }
+
       yield* writeDefaultTheme({ settingsPath: paths.settingsPath, themeId }).pipe(
-        Effect.onError(() => revertPublish),
+        Effect.onError(() => revertBackground.pipe(Effect.andThen(revertPublish))),
       );
       yield* cleanupPublish;
+      yield* commitBackground;
       yield* Console.log(
         targetIsFile
           ? `Published ${target} as "${themeId}" and set it as the environment theme.\n`
           : `Environment theme set to "${themeId}" in ${paths.settingsPath}.\n`,
       );
+      if (backgroundNote !== undefined) yield* Console.log(backgroundNote);
     }),
   ),
 );
