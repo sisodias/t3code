@@ -10,7 +10,8 @@ The T3 Code that SISO runs is an upstream nightly from pingdotgg/t3code plus a s
 | updates: T3's update offer starts a SISO rebuild | `siso/updates` | nightly | SISO-only, never upstream |
 | glibc-ceiling: a build made on this laptop may use its own glibc | `siso/linux-glibc-ceiling` | nightly | draft in `upstream-pr/linux-glibc-ceiling.md` |
 | video-backgrounds | `feat/theme-video-backgrounds` (#1) | nightly | draft is the body of #1 |
-| background-page (optional until it is on the fork) | `feat/theme-background-page` (#2) | video-backgrounds | draft is the body of #2 |
+| background-page | `feat/theme-background-page` (#2) | video-backgrounds | draft is the body of #2 |
+| fleet: a Fleet button lists every machine's agents | `siso/fleet` (#6) | nightly | draft is the body of #6 |
 
 `stack.json` gives the order, each patch's tests, and the checks run on the combined build.
 
