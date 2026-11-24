@@ -50,6 +50,16 @@ export function createPeerLinkEnvironmentAtoms<R, E>(
     tag: WS_METHODS.peerLinksNames,
     staleTimeMs: 10_000,
   });
+  /**
+   * A linked environment's threads under way and its latest, read over the link. Each read asks
+   * the linked machine, so it stays fresh briefly and is read again only while someone looks.
+   */
+  const threads = createEnvironmentRpcQueryAtomFamily(runtime, {
+    label: "environment-data:peer-links:threads",
+    tag: WS_METHODS.peerLinksListThreads,
+    staleTimeMs: 15_000,
+    refreshIntervalMs: 30_000,
+  });
   const refreshLinks = (registry: AtomRegistry.AtomRegistry, environmentId: EnvironmentId) =>
     Effect.sync(() => {
       registry.refresh(list({ environmentId, input: {} }));
@@ -101,6 +111,7 @@ export function createPeerLinkEnvironmentAtoms<R, E>(
   return {
     list,
     names,
+    threads,
     /**
      * Rereads `environmentId`'s link names when they lack one of `wanted`, however fresh they
      * are. Links made elsewhere (the CLI, another client, a batch) are not pushed, so a reader
