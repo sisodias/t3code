@@ -3,7 +3,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import afterPack from "./linux-after-pack.ts";
 import { parseGlibcNeeds, scanGlibcNeeds } from "./linux-glibc.ts";
@@ -133,4 +133,21 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("packaged ELF s
       }
     },
   );
+
+  it("lets a build for one newer machine raise the ceiling to that machine's glibc", async () => {
+    const app = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-glibc-"));
+    try {
+      await NodeFSP.writeFile(NodePath.join(app, "pty.node"), elfFixture(183, "2.42"));
+      await expect(scanGlibcNeeds(app)).rejects.toThrow(/pty\.node.*GLIBC_2\.42.*2\.39/s);
+      vi.stubEnv("T3CODE_LINUX_GLIBC_CEILING", "2.43");
+      expect(await scanGlibcNeeds(app)).toEqual({ minimum: "2.42", elfCount: 1 });
+      vi.stubEnv("T3CODE_LINUX_GLIBC_CEILING", "2.41");
+      await expect(scanGlibcNeeds(app)).rejects.toThrow(/GLIBC_2\.42.*2\.41/s);
+      vi.stubEnv("T3CODE_LINUX_GLIBC_CEILING", "newest");
+      await expect(scanGlibcNeeds(app)).rejects.toThrow(/T3CODE_LINUX_GLIBC_CEILING.*"newest"/);
+    } finally {
+      vi.unstubAllEnvs();
+      await NodeFSP.rm(app, { recursive: true, force: true });
+    }
+  });
 });
