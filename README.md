@@ -12,6 +12,7 @@ The T3 Code that SISO runs is an upstream nightly from pingdotgg/t3code plus a s
 | video-backgrounds | `feat/theme-video-backgrounds` (#1) | nightly | draft is the body of #1 |
 | background-page | `feat/theme-background-page` (#2) | video-backgrounds | draft is the body of #2 |
 | fleet: a Fleet button lists every machine's agents | `siso/fleet` (#6) | nightly | draft is the body of #6 |
+| fleet-doing: fleet rows say what each agent is doing | `siso/fleet-doing` (#7) | fleet | draft is the body of #7 |
 
 `stack.json` gives the order, each patch's tests, and the checks run on the combined build.
 

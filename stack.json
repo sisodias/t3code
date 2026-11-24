@@ -196,6 +196,48 @@
           ]
         }
       ]
+    },
+    {
+      "name": "fleet-doing",
+      "branch": "siso/fleet-doing",
+      "base": "fleet",
+      "why": "Shaan, 24 Nov 2026: \"... what sub-agents they have underneath them or what they're working on ...\" Fleet rows say what each agent is doing, and a linked machine's plan limit is named instead of reading \"Stopped\".",
+      "upstream_pr": null,
+      "tests": [
+        {
+          "cwd": "apps/server",
+          "args": [
+            "vp",
+            "test",
+            "run",
+            "src/peer/PeerLinkThreads.test.ts",
+            "src/orchestration-v2/ThreadManagementService.test.ts",
+            "src/relay/AgentAwarenessRelay.test.ts"
+          ]
+        },
+        {
+          "cwd": "apps/web",
+          "args": [
+            "vp",
+            "test",
+            "run",
+            "--project",
+            "unit",
+            "src/components/fleet/fleet.logic.test.ts"
+          ]
+        },
+        {
+          "cwd": "apps/web",
+          "args": [
+            "vp",
+            "test",
+            "run",
+            "--project",
+            "browser",
+            "src/components/fleet/FleetMenu.browser.test.tsx"
+          ]
+        }
+      ]
     }
   ],
   "build_checks": [
