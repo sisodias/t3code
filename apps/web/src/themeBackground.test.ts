@@ -19,6 +19,7 @@ vi.mock(import("./state/server"), async () => {
     themeServerEnvironmentThemesAtom: Atom.make([
       { id: "nightfall", background: "revision-1" },
       { id: "loop", background: "revision-1", backgroundKind: "video" },
+      { id: "scene", background: "revision-1", backgroundPage: "https://scene.example/live" },
     ]),
   } as never;
 });
@@ -85,21 +86,43 @@ function setup(storage: Record<string, string> = {}) {
   const browser = Object.assign(new EventTarget(), {
     localStorage: { getItem: (key: string) => storage[key] ?? null },
     matchMedia: () => Object.assign(new EventTarget(), { matches: false }),
+    location: { origin: "https://app.example" },
+    setTimeout: (run: () => void, ms: number) => setTimeout(run, ms),
+    clearTimeout: (handle: ReturnType<typeof setTimeout>) => clearTimeout(handle),
   });
   vi.stubGlobal("window", browser);
   invalidateCustomThemes();
   const body: Array<unknown> = [];
   const videos: Array<ReturnType<typeof fakeVideo>> = [];
+  const frames: Array<{ src: string; readonly attributes: Map<string, string> }> = [];
+  const rootAttributes = new Map<string, string>();
   const page = Object.assign(new EventTarget(), {
     visibilityState: "visible",
     body: { prepend: (element: unknown) => body.unshift(element) },
     createElement: (tag: string) => {
+      if (tag === "iframe") {
+        const attributes = new Map<string, string>();
+        const frame = Object.assign(new EventTarget(), {
+          src: "",
+          attributes,
+          contentWindow: { postMessage: vi.fn() },
+          setAttribute: (name: string, value: string) => attributes.set(name, value),
+          remove: () => {
+            const index = body.indexOf(frame);
+            if (index >= 0) body.splice(index, 1);
+          },
+        });
+        frames.push(frame);
+        return frame;
+      }
       expect(tag).toBe("video");
       const video = fakeVideo(body);
       videos.push(video);
       return video;
     },
     documentElement: {
+      setAttribute: (name: string, value: string) => rootAttributes.set(name, value),
+      removeAttribute: (name: string) => rootAttributes.delete(name),
       dataset: { themeId: "nightfall" },
       style: {
         setProperty: (name: string, value: string) => properties.set(name, value),
@@ -118,6 +141,8 @@ function setup(storage: Record<string, string> = {}) {
     properties,
     body,
     videos,
+    frames,
+    rootAttributes,
     browser,
     fetchBackground,
     stop,
@@ -132,6 +157,35 @@ function setup(storage: Record<string, string> = {}) {
 }
 
 describe("theme backgrounds", () => {
+  it("shows a published theme's background page beside its image, until the theme changes", async () => {
+    using t = setup();
+    t.fetchBackground.mockImplementation(loaded);
+    applyThemeBackground("scene");
+    await vi.advanceTimersByTimeAsync(0);
+    const shown = () => t.body.filter((element) => t.frames.includes(element as never));
+    expect(shown()).toHaveLength(1);
+    expect(t.frames[0]?.src).toBe("https://scene.example/live");
+    expect(t.rootAttributes.get("data-theme-background-page")).toBe("loading");
+    expect(t.properties.get(BACKGROUND)).toMatch(/^url\("blob:/);
+
+    // The theme file is published again, as a sky that changes every few minutes does.
+    applyThemeBackground("scene");
+    expect(t.frames).toHaveLength(1);
+
+    applyThemeBackground("nightfall");
+    expect(shown()).toHaveLength(0);
+    expect(t.rootAttributes.has("data-theme-background-page")).toBe(false);
+  });
+
+  it("removes the background page when stopped", () => {
+    using t = setup();
+    applyThemeBackground("scene");
+    expect(t.frames).toHaveLength(1);
+    t.stop();
+    expect(t.body).toHaveLength(0);
+    expect(t.rootAttributes.has("data-theme-background-page")).toBe(false);
+  });
+
   it("retries a failed download after 1, 2, 4 and 8 seconds", async () => {
     using t = setup();
     t.fetchBackground
