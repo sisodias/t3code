@@ -830,6 +830,11 @@ export const OrchestrationV2Run = Schema.Struct({
   queuePosition: Schema.optional(Schema.NullOr(PositiveInt)),
   queueHeld: Schema.optional(Schema.Boolean),
   steerWhenReadyRunId: Schema.optional(RunId),
+  /**
+   * Why a message that asked to join the running turn waits for the next one instead, in words a
+   * person reads. Absent for a message queued on purpose and for one held for a starting turn.
+   */
+  queueReason: Schema.optional(Schema.String),
   requestedAt: Schema.DateTimeUtc,
   startedAt: Schema.NullOr(Schema.DateTimeUtc),
   completedAt: Schema.NullOr(Schema.DateTimeUtc),

@@ -450,19 +450,27 @@ describe("orchestrator MCP toolkit", () => {
             ),
           );
 
-        const queuedFollowupCall = yield* invoke("t3_thread_send", {
+        // An agent's send now joins the running follow-up instead of queuing. The composer's
+        // explicit Queue (no delivery intent) still makes a separate turn, which this test needs
+        // to report two follow-up results.
+        const queuedMessageId = MessageId.make("message:delegated-child-replay-queued-1");
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("command:delegated-child-replay-queued-1"),
           threadId: localChild(delegated.childThreadId),
-          message: queuedFollowupPrompt,
-          mode: "queue",
-          clientRequestId: "delegated-child-replay-queued-1",
+          messageId: queuedMessageId,
+          senderThreadId: parentThreadId,
+          text: queuedFollowupPrompt,
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "agent",
+          creationSource: "mcp",
         });
-        const queuedFollowup = yield* decodeThreadSendResult(
-          queuedFollowupCall.structuredContent,
-        ).pipe(Effect.orDie);
-        expect(queuedFollowup).toMatchObject({
-          status: "queued",
-          delivery: "queued",
-        });
+        const queuedRun = (yield* orchestrator.getThreadProjection(
+          localChild(delegated.childThreadId),
+        )).runs.find((run) => run.userMessageId === queuedMessageId)!;
+        const queuedFollowup = { runId: queuedRun.id, taskId: queuedRun.delegatedTaskId };
+        expect(queuedRun.status).toBe("queued");
 
         const pendingProjection = yield* orchestrator.getThreadProjection(
           localChild(delegated.childThreadId),

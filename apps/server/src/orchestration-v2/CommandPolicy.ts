@@ -144,6 +144,33 @@ export function resolveMessageDispatchIntent(
     : mode;
 }
 
+/**
+ * Why automatic input to this thread waits for the next turn instead of joining the active one,
+ * in words a person reads. Undefined when nothing is active, so the message starts at once.
+ */
+export function automaticQueueReason(
+  projection: OrchestrationV2ThreadProjection,
+): string | undefined {
+  const activeRun = projection.runs.findLast(isActiveRun);
+  if (activeRun === undefined) return undefined;
+  const activeMessage = projection.messages.find(
+    (message) => message.id === activeRun.userMessageId,
+  );
+  if (activeMessage !== undefined && isNativeMaintenanceCommand(activeMessage)) {
+    return activeMessage.text.trim().toLowerCase() === "/compact"
+      ? "the agent is compacting its context, which takes no messages until it ends."
+      : "the agent is signing out, which takes no messages until it ends.";
+  }
+  if (activeRun.status === "waiting") {
+    return "the turn has ended and its run is finishing; this starts the next turn.";
+  }
+  const turns = providerTurnCapabilities(projection, activeRun);
+  if (turns !== undefined && !turns.supportsActiveSteering) {
+    return "this provider cannot take a message during a turn.";
+  }
+  return "the turn could not take the message yet.";
+}
+
 /** A run that still owns the thread's provider turn. */
 export function isActiveRun(run: OrchestrationV2Run): boolean {
   return (
@@ -218,8 +245,10 @@ function resolveDeliveryIntent(
   if (deliveryIntent === "restart") {
     return { type: "restart_active", targetRunId: activeRun.id };
   }
-  // A run can be active before its provider turn starts or after it finishes.
-  // Queue automatic input in those gaps so steering cannot reject the message.
+  const capabilities = providerTurnCapabilities(projection, activeRun);
+  // Automatic input before the provider turn runs still targets the run: the orchestrator holds
+  // it for that turn (steerWhenReadyRunId). A provider that cannot steer, and a run that only
+  // waits on background work, keep the queue.
   if (
     activeRun.status === "preparing" ||
     activeRun.status === "starting" ||
@@ -227,10 +256,11 @@ function resolveDeliveryIntent(
       (turn) => turn.runAttemptId === activeRun.activeAttemptId && turn.status === "running",
     )
   ) {
-    return { type: "queue_after_active" };
+    return activeRun.status === "waiting" || capabilities?.supportsActiveSteering === false
+      ? { type: "queue_after_active" }
+      : { type: "steer_active", targetRunId: activeRun.id };
   }
 
-  const capabilities = providerTurnCapabilities(projection, activeRun);
   if (capabilities?.supportsActiveSteering === true) {
     return { type: "steer_active", targetRunId: activeRun.id };
   }

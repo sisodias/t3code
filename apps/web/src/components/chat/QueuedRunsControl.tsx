@@ -51,6 +51,7 @@ import { GuestMessageName } from "./guestMessageStyle";
 import { TimelineRowTimestamp } from "./TimelineRowParts";
 import { FoldedMessageHeader, useScheduledTaskTitle } from "./TimelineUserMessageRow";
 import { buildExpandedImagePreview, type ExpandedImagePreview } from "./ExpandedImagePreview";
+import { waitingMessageStatus } from "./deliveryLabels";
 
 export interface EditQueuedRunRequest {
   readonly runId: RunId;
@@ -144,6 +145,7 @@ export function QueuedRunsControl({
       runId: run.id,
       messageId: run.userMessageId,
       freshContext: run.freshContext === true,
+      status: waitingMessageStatus(run, gt),
       serverIndex,
       text,
       // A guest's message keeps the guest's words; the owner can cancel it, not rewrite it.
@@ -165,6 +167,7 @@ export function QueuedRunsControl({
       runId: null,
       messageId: null,
       freshContext: false,
+      status: waitingMessageStatus(undefined, gt),
       serverIndex: null,
       text: message.text,
       editable: true,
@@ -284,10 +287,18 @@ export function QueuedRunsControl({
           return (
             <li
               key={item.key}
-              aria-label={gt("Queued message {position} of {total}, not sent", {
-                position: position + 1,
-                total: items.length,
-              })}
+              aria-label={
+                item.status.queued
+                  ? gt("Queued message {position} of {total}, not sent", {
+                      position: position + 1,
+                      total: items.length,
+                    })
+                  : gt("Message {position} of {total}. {detail}", {
+                      position: position + 1,
+                      total: items.length,
+                      detail: item.status.detail,
+                    })
+              }
               aria-posinset={position + 1}
               aria-setsize={items.length}
               aria-current={isEditing ? "true" : undefined}
@@ -348,6 +359,16 @@ export function QueuedRunsControl({
                       </TooltipPopup>
                     </Tooltip>
                   </>
+                ) : null}
+                {!item.pending && !isEditing ? (
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={<span className="px-1" data-waiting-status={item.status.queued} />}
+                    >
+                      {item.status.label}
+                    </TooltipTrigger>
+                    <TooltipPopup>{item.status.detail}</TooltipPopup>
+                  </Tooltip>
                 ) : null}
                 {item.pending ? (
                   <span className="flex items-center gap-1 px-1">

@@ -128,6 +128,7 @@ import {
 } from "./CheckpointRestoreSafety.ts";
 import { CheckpointServiceV2 } from "./CheckpointService.ts";
 import {
+  automaticQueueReason,
   CommandPolicyV2,
   followUpOwnerRun,
   goalCommandStopsActiveRun,
@@ -7632,6 +7633,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       goalCommand === null
         ? resolveMessageDispatch(projection, command)
         : resolveMessageDispatchIntent(projection, command.dispatchMode, command.deliveryIntent);
+    // Why a message that asked to join the running turn waits for the next one. A person sees
+    // it on the queued message; a message queued on purpose (a command) has none.
+    let queueReason =
+      command.deliveryIntent !== undefined &&
+      dispatchMode.type === "queue_after_active" &&
+      resolveMessageDispatchIntent(projection, command.dispatchMode, command.deliveryIntent)
+        .type === "queue_after_active"
+        ? automaticQueueReason(projection)
+        : undefined;
     if (dispatchMode.type === "steer_active" || dispatchMode.type === "restart_active") {
       const targetRunId = dispatchMode.targetRunId;
       const target = projection.runs.find((run) => run.id === targetRunId);
@@ -7665,6 +7675,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       (yield* stopReachedRun(command, command.threadId, dispatchMode.targetRunId))
     ) {
       dispatchMode = { type: "queue_after_active" };
+      queueReason = "the turn was stopped; this starts the next one.";
     }
     // An agent's automatic send must not overtake its own earlier message still queued
     // (e.g. behind /compact), or the agent receives them out of send order.
@@ -8003,21 +8014,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         // Such a caller's message waits for its own turn instead.
         if (yield* limitForbidsParkedSteer) {
           dispatchMode = { type: "queue_after_active" };
+          queueReason = "this sender may not join a turn whose modes are not set yet.";
         } else {
-          const adapter = yield* providerAdapters
-            .get(target.providerInstanceId)
-            .pipe(mapDispatchError(command));
-          const capabilities = yield* adapter.getCapabilities().pipe(mapDispatchError(command));
-          yield* commandPolicy
-            .decideSteeringExecution({
-              commandId: command.commandId,
-              threadId: command.threadId,
-              providerInstanceId: target.providerInstanceId,
-              capabilities,
-            })
-            .pipe(mapDispatchError(command));
-          yield* ensureSteeringMessage(command, command);
-          steerWhenReadyRunId = target.id;
+          const holdForTurn = Effect.gen(function* () {
+            const adapter = yield* providerAdapters
+              .get(target.providerInstanceId)
+              .pipe(mapDispatchError(command));
+            const capabilities = yield* adapter.getCapabilities().pipe(mapDispatchError(command));
+            yield* commandPolicy
+              .decideSteeringExecution({
+                commandId: command.commandId,
+                threadId: command.threadId,
+                providerInstanceId: target.providerInstanceId,
+                capabilities,
+              })
+              .pipe(mapDispatchError(command));
+            yield* ensureSteeringMessage(command, command);
+          });
+          // An explicit steer still fails here. Automatic input that the starting turn cannot
+          // take falls back to the queue, as before, and says why.
+          const held =
+            command.deliveryIntent === "auto"
+              ? yield* holdForTurn.pipe(
+                  Effect.as(true),
+                  Effect.orElseSucceed(() => false),
+                )
+              : yield* holdForTurn.pipe(Effect.as(true));
+          if (held) steerWhenReadyRunId = target.id;
+          else queueReason = "this provider cannot take a message before its turn starts.";
           dispatchMode = { type: "queue_after_active" };
         }
       }
@@ -8282,6 +8306,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         activeAttemptId: attemptId,
         status: "queued",
         ...(steerWhenReadyRunId === undefined ? {} : { steerWhenReadyRunId }),
+        ...(queueReason === undefined || steerWhenReadyRunId !== undefined ? {} : { queueReason }),
         // A restart cancels its run; nobody knows whether the provider read the steer, so a person decides.
         ...(worktreeMissingRun !== undefined ||
         steerFollowUpSource?.status === "cancelled" ||
