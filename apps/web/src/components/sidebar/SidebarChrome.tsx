@@ -16,6 +16,7 @@ import { primaryServerKeybindingsAtom } from "../../state/server";
 import { cn } from "../../lib/utils";
 import { useIssuesSupported, usePullRequestsSupported } from "../../state/environments";
 import { T3Wordmark } from "../T3Wordmark";
+import { FleetButton } from "../fleet/FleetMenu";
 import {
   resolveEnvironmentIdentificationPillLabel,
   resolveSidebarStageBackdropVariant,
@@ -92,6 +93,9 @@ export const SidebarChromeHeader = memo(function SidebarChromeHeader({
             </Badge>
           </div>
         ) : null}
+      </div>
+      <div className="relative z-10 flex shrink-0 items-center">
+        <FleetButton onBackdrop={backdropVariant !== null} />
       </div>
     </div>
   );

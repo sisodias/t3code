@@ -108,6 +108,7 @@ import * as OtlpEndpointCheck from "./observability/OtlpEndpointCheck.ts";
 import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
 import * as PeerLinkRequests from "./peer/PeerLinkRequests.ts";
+import * as PeerLinkThreads from "./peer/PeerLinkThreads.ts";
 import * as PeerThreadRelay from "./peer/PeerThreadRelay.ts";
 import * as PeerClientPairing from "./peer/PeerClientPairing.ts";
 import * as PeerLinks from "./peer/PeerLinks.ts";
@@ -865,6 +866,7 @@ const layerUnusedConfigRpcServices = Layer.mergeAll(
   Layer.mock(PeerLinks.PeerLinks)({}),
   Layer.mock(PeerLinkRequests.PeerLinkRequests)({}),
   Layer.mock(PeerThreadRelay.PeerThreadRelay)({}),
+  Layer.mock(PeerLinkThreads.PeerLinkThreads)({}),
   Layer.mock(PeerClientPairing.PeerClientPairing)({}),
   Layer.mock(PortScanner.PortDiscovery)({ trackAgent: () => () => undefined }),
   Layer.mock(PreviewManager.PreviewManager)({}),
