@@ -190,7 +190,10 @@ that draws itself live, such as an animated scene, with `backgroundPage` in its 
 
 The page must be https (or http on `localhost` or `127.0.0.1` while you develop it), and from
 another origin than T3 Code. It loads in a frame behind the whole app, which the browser runs in its
-own process, so its drawing does not hold up typing or scrolling. The frame is sandboxed: the page
+own process, so its scripts do not hold up typing or scrolling. Its drawing shares the GPU with the
+app, though: a page that keeps the GPU busy makes every frame T3 Code draws, and so every keystroke,
+reach the screen later. Measure it on the slowest computer it will run on, and use a background video
+where it is too heavy. The frame is sandboxed: the page
 can run scripts and reach its own site, but it cannot open windows, navigate the app, or take
 clicks, keys, or focus. Under reduced motion no page loads.
 
@@ -203,7 +206,9 @@ parent.postMessage({ type: "t3-background-page", state: "ready" }, "*");
 Until then the root element's `data-theme-background-page` attribute is `loading` and the app's
 surfaces stay as they are, so a theme can keep a still background image as the fallback. A page that
 is not ready within 20 seconds is removed (`failed`) and tried again after 10 seconds, a minute, and
-five minutes, and again when the computer comes back online. Once the page is ready the attribute is
+then every five minutes, and at once when the computer comes back online. A window nobody can see may
+get no frames, so a page that waits to draw before it is ready can fail until the window is shown.
+Once the page is ready the attribute is
 `ready`, and the theme's CSS decides where it shows:
 
 ```css

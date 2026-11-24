@@ -214,18 +214,25 @@ describe("theme background page", () => {
     expect(t.state).toBe("ready");
   });
 
-  it("gives up after its retries until the browser is back online", () => {
+  it("keeps trying at its last delay, and at once when the browser is back online", () => {
     const t = setup();
     showThemeBackgroundPage(PAGE, t.view);
     for (const delay of RETRY_DELAYS_MS) t.advance(READY_TIMEOUT_MS + delay);
     t.advance(READY_TIMEOUT_MS);
     expect(t.state).toBe("failed");
-    t.advance(24 * 60 * 60 * 1000);
     expect(t.body).toHaveLength(0);
+
+    t.advance(RETRY_DELAYS_MS.at(-1)!);
+    expect(t.state).toBe("loading");
+    expect(t.body).toHaveLength(1);
+    t.advance(READY_TIMEOUT_MS);
+    expect(t.state).toBe("failed");
 
     t.online();
     expect(t.state).toBe("loading");
     expect(t.body).toHaveLength(1);
+    t.ready();
+    expect(t.state).toBe("ready");
   });
 
   it("waits for ready again when the page reloads itself", () => {

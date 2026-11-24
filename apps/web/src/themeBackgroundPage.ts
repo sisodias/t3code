@@ -91,8 +91,9 @@ export function showThemeBackgroundPage(url: string, view: ThemeBackgroundPageVi
   const fail = () => {
     unmount();
     setState("failed");
-    const delay = RETRY_DELAYS_MS[retries++];
-    if (delay !== undefined) timer = view.setTimeout(mount, delay);
+    // Never for good: a window nobody can see (a closed laptop lid) gives the page no frames to draw.
+    const delay = RETRY_DELAYS_MS[Math.min(retries++, RETRY_DELAYS_MS.length - 1)]!;
+    timer = view.setTimeout(mount, delay);
   };
   const waitForReady = () => {
     stopTimer();
