@@ -336,11 +336,25 @@ def existing_build(version, build_commit):
     return image, made["sha256"]
 
 
+def host_glibc():
+    """This machine's glibc version, such as 2.43, or "" when getconf cannot say."""
+    try:
+        words = subprocess.run(["getconf", "GNU_LIBC_VERSION"], capture_output=True, text=True).stdout.split()
+    except OSError:
+        return ""
+    return words[-1] if len(words) == 2 and re.fullmatch(r"\d+(?:\.\d+)+", words[-1]) else ""
+
+
 def build_appimage(version, build_commit, kept, log, pnpm):
     target = build_dir(version, build_commit)
     staging = target.with_name(target.name + ".partial")
     shutil.rmtree(staging, ignore_errors=True)
     env = {"T3CODE_DESKTOP_UPDATE_REPOSITORY": STACK["update_feed"]}
+    # The build runs only on this machine, and its native modules compile against this machine's
+    # glibc, so that is the ceiling the glibc-ceiling patch checks them against.
+    glibc = host_glibc()
+    if glibc:
+        env["T3CODE_LINUX_GLIBC_CEILING"] = glibc
     ok, _ = sh(log, "build appimage", [*pnpm, "exec", "node", "scripts/build-desktop-artifact.ts", "--platform", "linux",
                                        "--target", "AppImage", "--arch", "arm64", "--build-version", version,
                                        "--output-dir", str(staging)], LANE, 3600, env=env, tail=60)

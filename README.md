@@ -8,6 +8,7 @@ The T3 Code that SISO runs is an upstream nightly from pingdotgg/t3code plus a s
 | --- | --- | --- | --- |
 | no-queue: messages join the running turn | `siso/no-queue` | nightly | draft in `upstream-pr/no-queue.md` |
 | updates: T3's update offer starts a SISO rebuild | `siso/updates` | nightly | SISO-only, never upstream |
+| glibc-ceiling: a build made on this laptop may use its own glibc | `siso/linux-glibc-ceiling` | nightly | draft in `upstream-pr/linux-glibc-ceiling.md` |
 | video-backgrounds | `feat/theme-video-backgrounds` (#1) | nightly | draft is the body of #1 |
 | background-page (optional until it is on the fork) | `feat/theme-background-page` (#2) | video-backgrounds | draft is the body of #2 |
 
@@ -22,7 +23,7 @@ The T3 Code that SISO runs is an upstream nightly from pingdotgg/t3code plus a s
 3. If a patch no longer applies, stops. The current build stays, and the message names the patch, the commit and the conflicting files.
 4. Merges the patches onto the nightly. That merge is the build commit, and it is reproducible: the same nightly and patch tips always give the same commit.
 5. Runs each patch's tests and the build checks there. Any failure names the patch and keeps the current build.
-6. Builds the arm64 AppImage into `~/.local/share/t3code/siso-<version>-<commit>/`, with `build.json` beside it. The app's update feed points at upstream, so T3 keeps offering new nightlies.
+6. Builds the arm64 AppImage into `~/.local/share/t3code/siso-<version>-<commit>/`, with `build.json` beside it. The app's update feed points at upstream, so T3 keeps offering new nightlies. The build's glibc ceiling is this machine's glibc (`getconf GNU_LIBC_VERSION`), because node-pty compiles against it.
 7. Pushes the rebased patch branches with `--force-with-lease`, plus `siso/build` and a `siso/<version>-<commit>` tag. Fast-forwards the fork's `main` to the nightly.
 8. Arms `bin/t3-switch-when-idle --to <AppImage>`. That waits until T3 has no turn running, swaps the app, checks it is healthy, and rolls back to the previous build if not.
 
