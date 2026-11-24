@@ -6,6 +6,8 @@ import * as Scope from "effect/Scope";
 
 import { AppImageUpdater, autoUpdater } from "electron-updater";
 
+import { handOffToSisoUpdate, refuseStockUpdate } from "./SisoUpdateHandoff.ts";
+
 type AutoUpdater = typeof autoUpdater;
 type SpawnLog = (cmd: string, args?: Array<string>, ...rest: Array<unknown>) => Promise<boolean>;
 
@@ -100,6 +102,9 @@ export class ElectronUpdater extends Context.Service<
   }
 >()("@t3tools/desktop/electron/ElectronUpdater") {}
 
+// The version the last check offered; SISO rebuilds this one when asked to download it.
+let offeredVersion: string | undefined;
+
 /** @public */
 export const make = ElectronUpdater.of({
   setFeedURL: Effect.fn("ElectronUpdater.setFeedURL")(function (options) {
@@ -153,19 +158,32 @@ export const make = ElectronUpdater.of({
       });
     },
   ),
+  // SISO build: an offered update starts SISO's rebuild of it; the stock update never downloads.
   checkForUpdates: Effect.suspend(() => {
     const channel = autoUpdater.channel;
+    autoUpdater.autoDownload = false;
     return Effect.tryPromise({
       try: () => autoUpdater.checkForUpdates(),
       catch: (cause) => new ElectronUpdaterCheckForUpdatesError({ channel, cause }),
-    }).pipe(Effect.asVoid);
+    }).pipe(
+      Effect.tap((result) =>
+        Effect.sync(() => {
+          if (result?.isUpdateAvailable !== true) return;
+          offeredVersion = result.updateInfo.version;
+          handOffToSisoUpdate(offeredVersion);
+        }),
+      ),
+      Effect.asVoid,
+    );
   }),
   downloadUpdate: Effect.suspend(() => {
     const channel = autoUpdater.channel;
-    return Effect.tryPromise({
-      try: () => autoUpdater.downloadUpdate(),
-      catch: (cause) => new ElectronUpdaterDownloadUpdateError({ channel, cause }),
-    }).pipe(Effect.asVoid);
+    return Effect.fail(
+      new ElectronUpdaterDownloadUpdateError({
+        channel,
+        cause: refuseStockUpdate(offeredVersion),
+      }),
+    );
   }),
   quitAndInstall: Effect.fn("ElectronUpdater.quitAndInstall")(function ({
     isSilent,
