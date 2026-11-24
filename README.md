@@ -65,6 +65,8 @@ ln -s "$PWD/../siso-tools/bin/t3-siso-update" ~/.local/bin/t3-siso-update
 
 Edit `lane` in `stack.json` if the build lane lives elsewhere.
 
+On Arch, also `sudo pacman -S libxcrypt-compat`: upstream's AppImage build packages a `.deb` too, with a bundled fpm whose Ruby needs `libcrypt.so.1`. The command checks for it before it starts.
+
 ## Adding or removing a patch
 
 - To add one: push its branch to the fork, then add an entry to `stack.json` with `name`, `branch`, `base` (`upstream` or an earlier patch's name) and `tests`.

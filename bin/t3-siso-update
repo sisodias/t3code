@@ -453,6 +453,11 @@ def cmd_run(args):
             raise Stop("setup_failed", f"the build lane {LANE} is missing; see README.md")
         if git("status", "--porcelain", "--untracked-files=no").stdout.strip():
             raise Stop("setup_failed", f"the build lane {LANE} has uncommitted changes; it belongs to this command")
+        # Upstream's AppImage build also packages a .deb with electron-builder's bundled fpm, whose
+        # Ruby links libcrypt.so.1. Arch ships that only in libxcrypt-compat. Say so before the long work.
+        if "libcrypt.so.1 " not in subprocess.run(["ldconfig", "-p"], capture_output=True, text=True).stdout:
+            raise Stop("setup_failed", "libcrypt.so.1 is missing, so the build's .deb step would fail; "
+                                       "install it with: sudo pacman -S libxcrypt-compat")
         log("begin", f"t3-siso-update run{' (T3 offered ' + args.offered + ')' if args.offered else ''}; log {log.path}")
         git("fetch", "--quiet", "--prune", STACK["fork"]["remote"], log=log)
         git("fetch", "--quiet", STACK["upstream"]["remote"], "--tags", log=log)
