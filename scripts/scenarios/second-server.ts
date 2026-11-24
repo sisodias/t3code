@@ -21,6 +21,7 @@ export const SECOND_HOME = `${T3_HOME}-second-environment`;
 const runSecondServer = Effect.fn("scenario.secondServer")(function* (
   devUrl: string,
   paired: (target: { readonly host: string; readonly token: string }) => void,
+  label: string | undefined,
 ) {
   const path = yield* Path.Path;
   const node = yield* HostProcess.ExecutablePath;
@@ -48,6 +49,7 @@ const runSecondServer = Effect.fn("scenario.secondServer")(function* (
       HOME: hostEnvironment.HOME,
       T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD: "0",
       ...SCENARIO_MACHINE_ENV,
+      ...(label === undefined ? {} : { T3CODE_ENVIRONMENT_LABEL: label }),
     },
     onLine: (line) => {
       const value = /^Token:\s*(\S+)/.exec(line)?.[1];
@@ -68,11 +70,14 @@ const runSecondServer = Effect.fn("scenario.secondServer")(function* (
   return yield* Effect.never;
 });
 
-/** Starts the second server for the web app at `devUrl`. `ready` settles with its pairing input. */
-export function startSecondServer(devUrl: string) {
+/**
+ * Starts the second server for the web app at `devUrl`. `ready` settles with its pairing input.
+ * `label` names the machine when a scenario shows both, which are otherwise both "Scenario".
+ */
+export function startSecondServer(devUrl: string, options: { readonly label?: string } = {}) {
   const pairing = Promise.withResolvers<{ readonly host: string; readonly token: string }>();
   const server = Effect.runFork(
-    runSecondServer(devUrl, pairing.resolve).pipe(
+    runSecondServer(devUrl, pairing.resolve, options.label).pipe(
       Effect.scoped,
       Effect.provide([NodeServices.layer, NetService.layer]),
     ),

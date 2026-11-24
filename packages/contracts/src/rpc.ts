@@ -34,6 +34,7 @@ import {
   PeerLinkThreadItemInput,
   PeerLinkThreadReadError,
 } from "./peerLink.ts";
+import { PeerLinkThreadsInput, PeerLinkThreadsResult } from "./peerLinkThreads.ts";
 import {
   ChatGptReconnectProfileInput,
   ChatGptReconnectProfile,
@@ -596,6 +597,7 @@ export const WS_METHODS = {
   serverReclaimDatabaseSpace: "server.reclaimDatabaseSpace",
   peerLinksList: "peerLinks.list",
   peerLinksNames: "peerLinks.names",
+  peerLinksListThreads: "peerLinks.listThreads",
   peerLinksLink: "peerLinks.link",
   peerLinksUnlink: "peerLinks.unlink",
   peerLinksAnswerRequest: "peerLinks.answerRequest",
@@ -963,6 +965,13 @@ const WsPeerLinksNamesRpc = Rpc.make(WS_METHODS.peerLinksNames, {
   payload: Schema.Struct({}),
   success: Schema.Struct({ links: Schema.Array(PeerLinkName) }),
   error: Schema.Union([PeerLinkError, EnvironmentAuthorizationError]),
+});
+
+/** A linked environment's threads under way and its latest, read over the link. */
+const WsPeerLinksListThreadsRpc = Rpc.make(WS_METHODS.peerLinksListThreads, {
+  payload: PeerLinkThreadsInput,
+  success: PeerLinkThreadsResult,
+  error: Schema.Union([PeerLinkThreadReadError, EnvironmentAuthorizationError]),
 });
 
 const WsPeerLinksLinkRpc = Rpc.make(WS_METHODS.peerLinksLink, {
@@ -2507,6 +2516,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerUpdateSettingsRpc,
   WsPeerLinksListRpc,
   WsPeerLinksNamesRpc,
+  WsPeerLinksListThreadsRpc,
   WsPeerLinksLinkRpc,
   WsPeerLinksUnlinkRpc,
   WsPeerLinksAnswerRequestRpc,
