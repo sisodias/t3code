@@ -640,6 +640,22 @@ const EnvironmentThemeColors = Schema.Record(
 );
 
 export const THEME_CSS_MAX_LENGTH = 100_000;
+const THEME_BACKGROUND_PAGE_MAX_LENGTH = 2_048;
+
+/**
+ * An https page, or an http page on this machine's loopback address for local development.
+ * Clients load it in a sandboxed frame from another origin, so it never reaches the app.
+ */
+export const EnvironmentThemeBackgroundPage = Schema.String.check(
+  Schema.isMaxLength(THEME_BACKGROUND_PAGE_MAX_LENGTH),
+  Schema.isPattern(
+    /^(?:https:\/\/[^\s/?#@]+|http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?)(?:[/?#][^\s]*)?$/,
+  ),
+).annotate({
+  description:
+    "An https URL of a page drawn live behind the app, such as an animated scene. Clients load it in a sandboxed cross-origin frame that takes no input, and show it once it posts a ready message.",
+});
+export type EnvironmentThemeBackgroundPage = typeof EnvironmentThemeBackgroundPage.Type;
 
 const environmentThemeFields = {
   version: Schema.optional(Schema.Literal(1)),
@@ -657,6 +673,8 @@ const environmentThemeFields = {
   ),
   /** Custom styles for web and desktop clients. */
   css: Schema.optional(Schema.String.check(Schema.isMaxLength(THEME_CSS_MAX_LENGTH))),
+  /** A page drawn live behind the app, in its own sandboxed frame. */
+  backgroundPage: Schema.optional(EnvironmentThemeBackgroundPage),
 };
 
 export const EnvironmentThemeFile = Schema.Struct(environmentThemeFields);
