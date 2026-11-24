@@ -1,0 +1,32 @@
+#!/bin/sh
+# Points the T3 Code launchers (both app menu entries and the Touch Bar key) at one AppImage.
+#   t3-switch-launchers /abs/path/to/T3-Code.AppImage
+#   t3-switch-launchers noqueue|stock|livebg      the 17 Nov 2026 builds, by name
+# Every T3 AppImage path under ~/.local/share/t3code in those files becomes the target, and
+# each changed file is copied to <file>.pre-switch first. Restart T3 Code to use it.
+set -eu
+t3=$HOME/.local/share/t3code
+old=$t3/nightly-0.1.11-20261117.4825
+case "${1:-}" in
+  /*.AppImage) to=$1 ;;
+  livebg) to=$old-livebg/T3-Code-Nightly-arm64.AppImage ;;
+  noqueue) to=$old-noqueue/T3-Code-Nightly-arm64.AppImage ;;
+  stock) to=$old/T3-Code-Nightly-arm64.AppImage ;;
+  *) echo "usage: t3-switch-launchers /abs/path.AppImage | noqueue | stock | livebg" >&2; exit 2 ;;
+esac
+case "$to" in *[[:space:]\|]*) echo "unsupported path (space or |): $to" >&2; exit 2 ;; esac
+[ -x "$to" ] || { echo "missing: $to" >&2; exit 1; }
+for f in \
+  "$HOME/.local/share/applications/t3code.desktop" \
+  "$HOME/.local/share/applications/com.t3tools.T3Code.desktop" \
+  "$HOME/.config/hypr/bindings.lua"; do
+  [ -f "$f" ] || continue
+  for from in $(grep -oE "$t3/[^\"' ]+\.AppImage" "$f" | sort -u); do
+    [ "$from" = "$to" ] && continue
+    cp -p "$f" "$f.pre-switch"
+    sed -i "s|$(printf '%s' "$from" | sed 's/[.[\*^$]/\\&/g')|$to|g" "$f"
+    echo "now $to: $f (was $from)"
+  done
+done
+update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+hyprctl reload >/dev/null 2>&1 || true

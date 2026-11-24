@@ -1,0 +1,74 @@
+{
+  "about": "SISO's patches on top of upstream T3 Code nightlies, applied in this order. bin/t3-siso-update reads this file.",
+  "upstream": { "remote": "upstream", "repo": "pingdotgg/t3code", "nightly_tag": "v*-nightly.*" },
+  "fork": { "remote": "origin", "repo": "sisodias/t3code", "build_branch": "siso/build", "build_tag_prefix": "siso/" },
+  "lane": "~/SISO_Workspace/_data/worktrees/t3code/siso-build",
+  "installs": "~/.local/share/t3code",
+  "update_feed": "pingdotgg/t3code",
+  "notify_thread": "mcp:launch:c2c020beb76b5d8fed3d349cf41caca797f486e1d2a2662caebec2314a656d82",
+  "toolchain": ["mise", "exec", "node@{node}", "--", "npx", "-y", "pnpm@{pnpm}"],
+  "measured_files": ["apps/server/src/provider/agentContextBudget.json"],
+  "patches": [
+    {
+      "name": "no-queue",
+      "branch": "siso/no-queue",
+      "base": "upstream",
+      "why": "Shaan, 19 Nov 2026: \"I don't like how the messages queue. They should just be instantly sent through.\"",
+      "upstream_pr": null,
+      "tests": [
+        { "cwd": "apps/server", "args": ["vp", "test", "run",
+          "src/orchestration-v2/CommandPolicy.test.ts",
+          "src/orchestration-v2/SteeringCompletion.integration.test.ts",
+          "src/orchestration-v2/ClaudeAutomaticDelivery.integration.test.ts",
+          "src/orchestration-v2/ThreadManagementService.test.ts",
+          "src/mcp/OrchestratorMcpToolkit.integration.test.ts",
+          "src/cli/thread.test.ts"] },
+        { "cwd": "apps/web", "args": ["vp", "test", "run", "--project", "unit", "src/components/chat/deliveryLabels.test.ts"] }
+      ]
+    },
+    {
+      "name": "updates",
+      "branch": "siso/updates",
+      "base": "upstream",
+      "why": "A SISO build never installs the stock update T3 offers; the offer starts this command instead.",
+      "siso_only": true,
+      "tests": [
+        { "cwd": "apps/desktop", "args": ["vp", "test", "run", "src/electron/SisoUpdateHandoff.test.ts", "src/electron/ElectronUpdater.test.ts"] }
+      ]
+    },
+    {
+      "name": "video-backgrounds",
+      "branch": "feat/theme-video-backgrounds",
+      "base": "upstream",
+      "why": "A theme can play a WebM or MP4 video behind the app (sisodias/t3code#1).",
+      "upstream_pr": null,
+      "tests": [
+        { "cwd": "apps/server", "args": ["vp", "test", "run",
+          "src/assets/AssetAccess.test.ts", "src/cli/theme.test.ts", "src/environmentTheme.test.ts",
+          "src/mcp/toolkits/theme/handlers.test.ts"] },
+        { "cwd": "apps/web", "args": ["vp", "test", "run", "--project", "unit",
+          "src/themeBackground.test.ts", "src/themeBackgroundVideo.test.ts"] }
+      ]
+    },
+    {
+      "name": "background-page",
+      "branch": "feat/theme-background-page",
+      "base": "video-backgrounds",
+      "why": "A theme can draw a live background page behind the app (sisodias/t3code#2).",
+      "upstream_pr": null,
+      "optional": true,
+      "tests": [
+        { "cwd": "apps/server", "args": ["vp", "test", "run", "src/environmentTheme.test.ts"] },
+        { "cwd": "apps/web", "args": ["vp", "test", "run", "--project", "unit",
+          "src/themeBackground.test.ts", "src/themeBackgroundPage.test.ts"] }
+      ]
+    }
+  ],
+  "build_checks": [
+    { "cwd": "apps/server", "args": ["vp", "test", "run", "src/provider/AgentContextBudget.test.ts"] },
+    { "cwd": "packages/contracts", "args": ["effect-tsgo", "tsrs", "--noEmit"] },
+    { "cwd": "apps/server", "args": ["effect-tsgo", "tsrs", "--noEmit"] },
+    { "cwd": "apps/web", "args": ["effect-tsgo", "tsrs", "--noEmit"] },
+    { "cwd": "apps/desktop", "args": ["effect-tsgo", "tsrs", "--noEmit"] }
+  ]
+}

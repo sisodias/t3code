@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Git merge driver for measured JSON files such as agentContextBudget.json.
+
+Each patch raises a measured number by its own amount, so two of them (or a patch and
+upstream) always conflict on the same line. The merged value is ours + (theirs - base):
+upstream's new measurement plus the patch's own growth. The build's test then checks the
+sum against a fresh measurement.
+
+usage (git sets these): siso-sum-json %O %A %B   -- writes the result to %A
+"""
+import json
+import sys
+
+
+def merge(base, ours, theirs, path="$"):
+    if ours == theirs or theirs == base:
+        return ours
+    if ours == base:
+        return theirs
+    if all(isinstance(v, dict) for v in (base, ours, theirs)):
+        keys = list(ours) + [k for k in theirs if k not in ours]
+        out = {}
+        for key in keys:
+            if key in ours and key in theirs and key in base:
+                out[key] = merge(base[key], ours[key], theirs[key], f"{path}.{key}")
+            elif key in ours and key in theirs:
+                if ours[key] != theirs[key]:
+                    raise ValueError(f"{path}.{key} added differently on both sides")
+                out[key] = ours[key]
+            elif key in ours:
+                if key in base and base[key] != ours[key]:
+                    raise ValueError(f"{path}.{key} removed on one side, changed on the other")
+                if key not in base:
+                    out[key] = ours[key]
+            elif key not in base:
+                out[key] = theirs[key]
+            elif base[key] != theirs[key]:
+                raise ValueError(f"{path}.{key} removed on one side, changed on the other")
+        return out
+    numbers = (int, float)
+    if all(isinstance(v, numbers) and not isinstance(v, bool) for v in (base, ours, theirs)):
+        return ours + (theirs - base)
+    raise ValueError(f"{path} changed on both sides and is not a number")
+
+
+def main():
+    base_path, ours_path, theirs_path = sys.argv[1:4]
+    try:
+        sides = [json.load(open(p)) for p in (base_path, ours_path, theirs_path)]
+        merged = merge(*sides)
+    except (OSError, ValueError) as exc:
+        print(f"siso-sum-json: {exc}", file=sys.stderr)
+        return 1
+    with open(ours_path, "w") as out:
+        json.dump(merged, out, indent=2)
+        out.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""Rebuild the newest upstream T3 Code nightly with SISO's patches and switch T3 to it when idle.
+
+Shaan, 24 Nov 2026: "Remember we have a way of SISO forking it so we can still keep the changes in the
+future. How can we make sure we're keeping T3's upgrades though?"
+
+  t3-siso-update run [--nightly TAG] [--no-switch] [--no-push] [--force]
+      1. fetch upstream's nightly tags and the fork; take the newest nightly (or --nightly)
+      2. drop a patch whose upstream PR is merged into that nightly; rebase every other patch branch
+         (stack.json, in order) onto it, or onto the patch it stacks on. A patch that rebases to
+         nothing was taken upstream and is dropped too. A patch that no longer applies stops the run:
+         the current build stays, and the message names the patch, its commit and the files.
+      3. merge the patches onto the nightly (the build commit), run each patch's tests and the
+         build checks there; a failure names the patch and keeps the current build
+      4. build the arm64 AppImage into ~/.local/share/t3code/siso-<version>-<commit>/, its update feed
+         pointed at upstream (the updates patch turns T3's update offer into `trigger`)
+      5. push the rebased patch branches (--force-with-lease), siso/build and a tag to the fork, and
+         fast-forward the fork's main to the nightly
+      6. hand the AppImage to t3-switch-when-idle, which swaps T3 once it is idle and rolls back if needed
+  t3-siso-update trigger --offered VERSION
+      What T3 runs when it offers an update: starts `run` as the transient systemd user unit
+      t3-siso-update, unless it is already running. `run` skips work it has already done or that
+      already failed for the same nightly and patch tips.
+  t3-siso-update status      the last result
+
+Results and failures are logged in ~/.local/state/t3-siso-update/ and sent to stack.json's notify_thread.
+Exit codes: 0 built (and switch armed) or nothing to do, 10 a patch no longer applies, 11 patches conflict
+with each other, 12 a test failed, 13 the build failed, 14 setup or git failed, 15 the switch was not armed.
+"""
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+TOOLS = Path(__file__).resolve().parent.parent
+STACK = json.loads((TOOLS / "stack.json").read_text())
+HOME = Path.home()
+STATE = HOME / ".local/state/t3-siso-update"
+UNIT = "t3-siso-update"
+WORK = "siso-update/"  # local branch prefix in the build lane
+SWITCH_TOOL = TOOLS / "bin/t3-switch-when-idle"
+T3_CLI = HOME / ".t3/bin/t3"
+NIGHTLY = re.compile(r"^v(\d+\.\d+\.\d+)-nightly\.(\d{8})\.(\d+)$")
+
+EXIT = {"ok": 0, "patch_broke": 10, "patches_conflict": 11, "test_failed": 12, "build_failed": 13,
+        "setup_failed": 14, "switch_failed": 15}
+
+
+class Stop(Exception):
+    def __init__(self, kind, message):
+        super().__init__(message)
+        self.kind = kind
+
+
+def utc():
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def expand(path):
+    return Path(os.path.expanduser(path))
+
+
+LANE = expand(STACK["lane"])
+INSTALLS = expand(STACK["installs"])
+
+
+class Log:
+    def __init__(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.file = open(path, "a", buffering=1)
+
+    def __call__(self, step, message):
+        line = f"{utc()} {step:<8} {message}"
+        print(line, flush=True)
+        self.file.write(line + "\n")
+
+
+# Merge drivers and rerere apply to every git call the command makes, without touching shared config.
+GIT_CONFIG = [
+    "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=true",
+    "-c", f"merge.siso-sum-json.driver={shlex.quote(str(TOOLS / 'bin/siso-sum-json'))} %O %A %B",
+    "-c", "merge.siso-sum-json.name=sum measured numbers",
+    "-c", f"core.attributesFile={STATE / 'measured.gitattributes'}",
+    "-c", "user.name=SISO t3-siso-update", "-c", "user.email=t3-siso-update@users.noreply.github.com",
+]
+
+
+def write_attributes():
+    """The measured files (stack.json) merge with siso-sum-json; the attributes file lives in the state dir."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    (STATE / "measured.gitattributes").write_text("".join(f"{f} merge=siso-sum-json\n" for f in STACK["measured_files"]))
+
+
+def git(*args, check=True, log=None, quiet=False, env=None):
+    done = subprocess.run(["git", *GIT_CONFIG, *args], cwd=LANE, capture_output=True, text=True,
+                          env={**os.environ, "GIT_EDITOR": "true", "GIT_TERMINAL_PROMPT": "0", **(env or {})})
+    if check and done.returncode != 0:
+        said = (done.stderr or done.stdout).strip()
+        raise Stop("setup_failed", f"git {' '.join(args)} failed: {said[-800:]}")
+    if log and not quiet:
+        said = (done.stdout + done.stderr).strip().splitlines()
+        log("git", f"git {' '.join(args)} -> {done.returncode}{': ' + said[-1][:200] if said else ''}")
+    return done
+
+
+def out(*args):
+    return git(*args).stdout.strip()
+
+
+def is_ancestor(a, b):
+    return git("merge-base", "--is-ancestor", a, b, check=False).returncode == 0
+
+
+def toolchain():
+    """mise + pnpm at the versions the nightly's package.json pins."""
+    pkg = json.loads((LANE / "package.json").read_text())
+    node = pkg.get("engines", {}).get("node", "").lstrip("^~>= ") or "26.13.1"
+    pnpm = pkg.get("packageManager", "pnpm@12.14.0").split("@", 1)[1].split("+")[0]
+    argv = [part.format(node=node, pnpm=pnpm) for part in STACK["toolchain"]]
+    argv[0] = shutil.which(argv[0]) or argv[0]
+    return argv
+
+
+def sh(log, label, argv, cwd, timeout, env=None, tail=40):
+    """Runs a check; the full output goes to its own log file, the tail to the run log on failure."""
+    path = log.path.with_name(f"{log.path.stem}.{re.sub(r'[^a-z0-9]+', '-', label.lower()).strip('-')}.log")
+    with open(path, "w") as f:
+        try:
+            done = subprocess.run(argv, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, timeout=timeout,
+                                  env={**os.environ, "CI": "1", **(env or {})})
+            code = done.returncode
+        except subprocess.TimeoutExpired:
+            code = "timeout"
+    text = path.read_text(errors="replace")
+    log("check", f"{label}: {'pass' if code == 0 else f'FAIL ({code})'} ({path.name})")
+    if code != 0:
+        for line in text.splitlines()[-tail:]:
+            log("output", line)
+    return code == 0, text
+
+
+# ---------- nightlies and patches ----------
+
+def newest_nightly():
+    tags = out("tag", "-l", STACK["upstream"]["nightly_tag"]).split()
+    parsed = [(tuple(map(int, m.group(1).split("."))), m.group(2), int(m.group(3)), t)
+              for t in tags if (m := NIGHTLY.match(t))]
+    if not parsed:
+        raise Stop("setup_failed", "no upstream nightly tags found")
+    return max(parsed)[3]
+
+
+def remote_tip(branch):
+    ref = f"refs/remotes/{STACK['fork']['remote']}/{branch}"
+    done = git("rev-parse", "--verify", "--quiet", ref + "^{commit}", check=False)
+    return done.stdout.strip() or None
+
+
+def past_tips(patch_name):
+    """Tips a patch had in earlier SISO builds: the merges on siso/build and the build tags name them."""
+    tips = []
+    refs = out("for-each-ref", "--format=%(refname)", f"refs/tags/{STACK['fork']['build_tag_prefix']}",
+               f"refs/remotes/{STACK['fork']['remote']}/{STACK['fork']['build_branch']}").split()
+    for ref in refs:
+        for line in out("log", "--merges", "--first-parent", "--format=%P%x09%s", ref).splitlines():
+            parents, _, subject = line.partition("\t")
+            if subject.startswith(f"siso: merge {patch_name} ") and len(parents.split()) == 2:
+                tips.append(parents.split()[1])
+    return tips
+
+
+def upstream_merged(patch, nightly_commit, log):
+    url = patch.get("upstream_pr")
+    if not url:
+        return None
+    done = subprocess.run(["gh", "pr", "view", url, "--json", "state,mergeCommit"], capture_output=True, text=True)
+    if done.returncode != 0:
+        log("patch", f"{patch['name']}: could not read {url} ({done.stderr.strip()[:200]}); keeping it")
+        return None
+    pr = json.loads(done.stdout)
+    merge = (pr.get("mergeCommit") or {}).get("oid")
+    if pr.get("state") == "MERGED" and merge and git("cat-file", "-e", merge, check=False).returncode == 0 \
+            and is_ancestor(merge, nightly_commit):
+        return f"upstream merged {url} as {merge[:10]}, which is in this nightly"
+    return None
+
+
+def rebase_patch(patch, new_parent, old_parent, log):
+    work = WORK + patch["name"]
+    git("switch", "--quiet", "--force-create", work, patch["source"])
+    if old_parent == new_parent:
+        log("rebase", f"{patch['name']}: already on its base")
+        return out("rev-parse", "HEAD")
+    # Author dates as committer dates: the same inputs always give the same commits.
+    done = git("rebase", "--committer-date-is-author-date", "--onto", new_parent, old_parent, check=False)
+    if done.returncode != 0:
+        files = out("diff", "--name-only", "--diff-filter=U").split()
+        stopped = git("log", "-1", "--format=%h %s", "REBASE_HEAD", check=False).stdout.strip()
+        git("rebase", "--abort", check=False)
+        raise Stop("patch_broke",
+                   f"patch {patch['name']} ({patch['branch']}) no longer applies to {patch['onto_label']}: "
+                   f"commit {stopped or '?'} conflicts in {', '.join(files) or 'unknown files'}. "
+                   f"The current build stays. Fix: rebase {patch['branch']} onto {patch['onto_label']} by hand, "
+                   f"push it, and run t3-siso-update run.")
+    return out("rev-parse", "HEAD")
+
+
+# ---------- the run ----------
+
+def plan(nightly, log):
+    nightly_commit = out("rev-parse", nightly + "^{commit}")
+    patches = []
+    for spec in STACK["patches"]:
+        patch = dict(spec)
+        patch["source"] = remote_tip(patch["branch"])
+        if patch["source"] is None:
+            if patch.get("optional"):
+                log("patch", f"{patch['name']}: {patch['branch']} is not on the fork yet; skipped (optional)")
+                continue
+            raise Stop("setup_failed", f"patch {patch['name']}: {patch['branch']} is missing on the fork")
+        patches.append(patch)
+    key_src = nightly_commit + "".join(f"|{p['name']}={p['source']}" for p in patches) + "|" + \
+        hashlib.sha256((TOOLS / "stack.json").read_bytes()).hexdigest()
+    return nightly_commit, patches, hashlib.sha256(key_src.encode()).hexdigest()[:16]
+
+
+def rebase_stack(nightly, nightly_commit, patches, log):
+    by_name = {}
+    for patch in patches:
+        reason = upstream_merged(patch, nightly_commit, log)
+        if reason:
+            patch["dropped"] = reason
+            log("patch", f"{patch['name']}: dropped, {reason}")
+            by_name[patch["name"]] = patch
+            continue
+        base = patch["base"]
+        if base == "upstream" or by_name.get(base, {}).get("dropped"):
+            new_parent, patch["onto_label"] = nightly_commit, nightly
+            old_parent = out("merge-base", patch["source"], nightly_commit)
+        else:
+            if base not in by_name:
+                raise Stop("setup_failed", f"patch {patch['name']} stacks on {base}, which is not before it in stack.json")
+            parent = by_name[base]
+            new_parent, patch["onto_label"] = parent["tip"], f"{base} ({parent['branch']})"
+            # Where it branched off the base patch: the newest of that patch's known tips it contains.
+            known = [parent["source"], *past_tips(base)]
+            inside = [t for t in dict.fromkeys(known) if is_ancestor(t, patch["source"])]
+            if not inside:
+                raise Stop("patch_broke", f"patch {patch['name']} does not contain any known tip of {base} "
+                                          f"({', '.join(t[:10] for t in known)}); rebase it onto {parent['branch']} by hand")
+            old_parent = max(inside, key=lambda t: int(out("rev-list", "--count", t)))
+        tip = rebase_patch(patch, new_parent, old_parent, log)
+        count = int(out("rev-list", "--count", f"{new_parent}..{tip}"))
+        if count == 0:
+            patch["dropped"] = "every commit is already in upstream"
+            log("patch", f"{patch['name']}: dropped, {patch['dropped']}")
+        else:
+            patch["tip"] = tip
+            log("patch", f"{patch['name']}: {count} commit(s) on {patch['onto_label']}, {patch['source'][:10]} -> {tip[:10]}")
+        by_name[patch["name"]] = patch
+    return [p for p in patches if not p.get("dropped")]
+
+
+def merge_build(nightly, nightly_commit, kept, log):
+    work = WORK + "build"
+    git("switch", "--quiet", "--force-create", work, nightly_commit)
+    # Dated like the nightly, so the same nightly and patch tips always give the same build commit.
+    when = out("log", "-1", "--format=%cI", nightly_commit)
+    dated = {"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when}
+    for patch in kept:
+        message = f"siso: merge {patch['name']} ({patch['branch']} {patch['tip'][:10]}) into {nightly}"
+        done = git("merge", "--no-ff", "-m", message, WORK + patch["name"], check=False, env=dated)
+        if done.returncode != 0:
+            files = out("diff", "--name-only", "--diff-filter=U").split()
+            git("merge", "--abort", check=False)
+            earlier = ", ".join(p["name"] for p in kept[:kept.index(patch)])
+            raise Stop("patches_conflict", f"patch {patch['name']} conflicts with {earlier or 'the nightly'} in "
+                                           f"{', '.join(files)}. The current build stays.")
+    return out("rev-parse", "HEAD")
+
+
+def run_checks(kept, log, pnpm):
+    ok, _ = sh(log, "install", [*pnpm, "install", "--frozen-lockfile", "--prefer-offline"], LANE, 1800)
+    if not ok:
+        raise Stop("setup_failed", "pnpm install failed in the build lane")
+    failed = []
+    for patch in kept:
+        for i, test in enumerate(patch.get("tests", [])):
+            ok, text = sh(log, f"{patch['name']} test {i + 1}", [*pnpm, "exec", *test["args"]], LANE / test["cwd"], 2400)
+            if not ok:
+                names = [line.strip() for line in text.splitlines() if re.match(r"\s*(FAIL|×)", line)][:5]
+                failed.append(f"{patch['name']} ({test['cwd']}: {'; '.join(names) or 'see log'})")
+    for i, check in enumerate(STACK.get("build_checks", [])):
+        ok, text = sh(log, f"build check {i + 1} {check['cwd']}", [*pnpm, "exec", *check["args"]], LANE / check["cwd"], 2400)
+        if not ok:
+            failed.append(f"build check {' '.join(check['args'][:3])} in {check['cwd']}")
+    if failed:
+        raise Stop("test_failed", f"tests failed on the combined build: {'; '.join(failed)}. The current build stays.")
+
+
+def build_dir(version, build_commit):
+    return INSTALLS / f"siso-{version}-{build_commit[:12]}"
+
+
+def existing_build(version, build_commit):
+    """A finished build of this commit: its tests passed and build.json records the AppImage."""
+    try:
+        made = json.loads((build_dir(version, build_commit) / "build.json").read_text())
+    except (OSError, ValueError):
+        return None
+    image = Path(made["appimage"])
+    if made.get("build_commit") != build_commit or not image.is_file():
+        return None
+    return image, made["sha256"]
+
+
+def build_appimage(version, build_commit, kept, log, pnpm):
+    target = build_dir(version, build_commit)
+    staging = target.with_name(target.name + ".partial")
+    shutil.rmtree(staging, ignore_errors=True)
+    env = {"T3CODE_DESKTOP_UPDATE_REPOSITORY": STACK["update_feed"]}
+    ok, _ = sh(log, "build appimage", [*pnpm, "exec", "node", "scripts/build-desktop-artifact.ts", "--platform", "linux",
+                                       "--target", "AppImage", "--arch", "arm64", "--build-version", version,
+                                       "--output-dir", str(staging)], LANE, 3600, env=env, tail=60)
+    images = sorted(staging.glob("*.AppImage"))
+    if not ok or len(images) != 1:
+        raise Stop("build_failed", f"the AppImage build failed ({len(images)} AppImage(s) made). The current build stays.")
+    shutil.rmtree(target, ignore_errors=True)
+    staging.rename(target)
+    image = target / images[0].name
+    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+    (target / "build.json").write_text(json.dumps({
+        "version": version, "build_commit": build_commit, "appimage": str(image), "sha256": digest,
+        "patches": {p["name"]: {"branch": p["branch"], "tip": p["tip"]} for p in kept}, "built": utc(),
+    }, indent=2) + "\n")
+    log("build", f"{image} sha256 {digest}")
+    return image, digest
+
+
+def push(nightly, nightly_commit, build_commit, version, kept, dropped, log):
+    remote = STACK["fork"]["remote"]
+    failures = []
+    for patch in kept:
+        if patch["tip"] == patch["source"]:
+            continue
+        done = git("push", f"--force-with-lease=refs/heads/{patch['branch']}:{patch['source']}", remote,
+                   f"{WORK}{patch['name']}:refs/heads/{patch['branch']}", check=False, log=log)
+        if done.returncode != 0:
+            failures.append(f"{patch['branch']} (it moved on the fork since this run read it)")
+    tag = f"{STACK['fork']['build_tag_prefix']}{version}-{build_commit[:12]}"
+    git("tag", "-f", "-a", "-m", f"SISO build of {nightly}: " + ", ".join(p["name"] for p in kept), tag, build_commit)
+    for refspec in (f"+{build_commit}:refs/heads/{STACK['fork']['build_branch']}", f"refs/tags/{tag}:refs/tags/{tag}"):
+        if git("push", remote, refspec, check=False, log=log).returncode != 0:
+            failures.append(refspec)
+    # The fork's main follows upstream so the fork's PRs show only their own commits. Fast-forward only.
+    main = remote_tip("main")
+    if main and is_ancestor(main, nightly_commit) and main != nightly_commit:
+        if git("push", remote, f"{nightly_commit}:refs/heads/main", check=False, log=log).returncode != 0:
+            failures.append("main fast-forward")
+    for patch in dropped:
+        log("patch", f"{patch['name']} was dropped ({patch['dropped']}); remove it from stack.json")
+    return tag, failures
+
+
+def running_appimage(port=3773):
+    """The AppImage the live T3 server runs from (its APPIMAGE), or None."""
+    found = re.search(r"pid=(\d+)", subprocess.run(["ss", "-ltnpH", f"sport = :{port}"], capture_output=True,
+                                                   text=True).stdout)
+    try:
+        environ = Path(f"/proc/{found.group(1)}/environ").read_bytes().split(b"\0") if found else []
+    except OSError:
+        return None
+    return next((e[9:].decode() for e in environ if e.startswith(b"APPIMAGE=")), None)
+
+
+def notify(message, log, thread=None):
+    thread = thread or STACK.get("notify_thread")
+    if not thread or os.environ.get("T3_SISO_UPDATE_QUIET"):
+        log("notify", f"(not sent) {message}")
+        return
+    done = subprocess.run([str(T3_CLI), "thread", "send", thread, message], capture_output=True, text=True, timeout=120)
+    log("notify", f"sent to {thread}: exit {done.returncode}")
+    if done.returncode != 0:
+        subprocess.run(["notify-send", "-u", "critical", "T3 SISO update", message[:400]], capture_output=True)
+
+
+def load_state():
+    try:
+        return json.loads((STATE / "state.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    STATE.mkdir(parents=True, exist_ok=True)
+    tmp = STATE / "state.json.tmp"
+    tmp.write_text(json.dumps(state, indent=2) + "\n")
+    tmp.replace(STATE / "state.json")
+
+
+def cmd_run(args):
+    STATE.mkdir(parents=True, exist_ok=True)
+    lock = open(STATE / "run.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("t3-siso-update is already running")
+        return 0
+    log = Log(STATE / f"{utc().replace(':', '')}-run.log")
+    write_attributes()
+    state = load_state()
+    result = {"started": utc(), "log": str(log.path), "offered": args.offered,
+              "full": not (args.no_push or args.no_switch)}
+    try:
+        if not LANE.is_dir():
+            raise Stop("setup_failed", f"the build lane {LANE} is missing; see README.md")
+        if git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+            raise Stop("setup_failed", f"the build lane {LANE} has uncommitted changes; it belongs to this command")
+        log("begin", f"t3-siso-update run{' (T3 offered ' + args.offered + ')' if args.offered else ''}; log {log.path}")
+        git("fetch", "--quiet", "--prune", STACK["fork"]["remote"], log=log)
+        git("fetch", "--quiet", STACK["upstream"]["remote"], "--tags", log=log)
+        nightly = args.nightly or newest_nightly()
+        version = nightly[1:]
+        nightly_commit, patches, key = plan(nightly, log)
+        result.update(nightly=nightly, key=key, patches={p["name"]: p["source"] for p in patches})
+        log("plan", f"{nightly} ({nightly_commit[:12]}); patches " +
+            ", ".join(f"{p['name']} {p['source'][:10]}" for p in patches) + f"; key {key}")
+        last = state.get("last", {})
+        failed_before = last.get("outcome") in ("test_failed", "patch_broke", "patches_conflict", "build_failed")
+        done_before = last.get("outcome") == "ok" and last.get("full")
+        if not args.force and last.get("key") == key and (failed_before or done_before):
+            log("skip", f"already done for these inputs: {last.get('outcome')} at {last.get('finished')} ({last.get('log')}); "
+                        "--force runs it again")
+            return EXIT["ok"] if last.get("outcome") == "ok" else EXIT[last["outcome"]]
+        kept = rebase_stack(nightly, nightly_commit, patches, log)
+        dropped = [p for p in patches if p.get("dropped")]
+        build_commit = merge_build(nightly, nightly_commit, kept, log)
+        result["build_commit"] = build_commit
+        log("build", f"build commit {build_commit[:12]}: {nightly} + " + ", ".join(p["name"] for p in kept))
+        found = existing_build(version, build_commit)
+        if found:
+            image, digest = found
+            log("build", f"already built and tested: {image} (sha256 {digest[:12]})")
+        else:
+            pnpm = toolchain()
+            run_checks(kept, log, pnpm)
+            image, digest = build_appimage(version, build_commit, kept, log, pnpm)
+        result.update(appimage=str(image), sha256=digest)
+        if args.no_push:
+            log("push", "skipped (--no-push)")
+            tag, push_failures = None, []
+        else:
+            tag, push_failures = push(nightly, nightly_commit, build_commit, version, kept, dropped, log)
+        previous = state.get("built_nightly_commit")
+        result.update(tag=tag, push_failures=push_failures, previous_nightly_commit=previous,
+                      upstream_commits=int(out("rev-list", "--count", f"{previous}..{nightly_commit}")) if previous else None)
+        summary = (f"T3 SISO build ready: {nightly} + {', '.join(p['name'] for p in kept)}"
+                   f"{' (dropped ' + ', '.join(p['name'] for p in dropped) + ')' if dropped else ''}, commit {build_commit[:12]}, "
+                   f"{image}." + (f" Push problems: {'; '.join(push_failures)}." if push_failures else ""))
+        if args.no_switch:
+            log("switch", "not armed (--no-switch)")
+        elif running_appimage() == str(image):
+            log("switch", "T3 already runs this build; nothing to switch")
+            summary += " T3 already runs it."
+        else:
+            wake = args.wake or STACK.get("notify_thread")
+            done = subprocess.run([sys.executable, str(SWITCH_TOOL), "arm", "--to", str(image), "--sha256", digest,
+                                   *(["--wake", wake] if wake else [])],
+                                  capture_output=True, text=True)
+            log("switch", f"t3-switch-when-idle arm -> {done.returncode}: {(done.stdout + done.stderr).strip()[:300]}")
+            if done.returncode != 0:
+                raise Stop("switch_failed", summary + " The switch was not armed: " + (done.stderr or done.stdout).strip()[:300])
+            summary += " The switch is armed: T3 swaps to it once idle (t3-switch-when-idle reports the result)."
+        log("done", summary)
+        result.update(outcome="ok", message=summary)
+        state["built_nightly_commit"] = nightly_commit
+        if not args.no_switch:
+            notify(summary, log, args.wake)
+        return EXIT["ok"]
+    except Stop as stop:
+        log("stop", str(stop))
+        result.update(outcome=stop.kind, message=str(stop))
+        notify(f"T3 SISO update stopped: {stop} Log: {log.path}", log, args.wake)
+        return EXIT[stop.kind]
+    finally:
+        result["finished"] = utc()
+        state["last"] = result
+        save_state(state)
+        with open(STATE / "history.log", "a") as history:
+            history.write(f"{result['finished']} {result.get('nightly', '?')} {result.get('outcome', '?')} {log.path.name}\n")
+        if LANE.is_dir():
+            git("rebase", "--abort", check=False)
+            git("merge", "--abort", check=False)
+
+
+def cmd_trigger(args):
+    if subprocess.run(["systemctl", "--user", "is-active", "--quiet", UNIT]).returncode == 0:
+        print(f"{UNIT} is already running")
+        return 0
+    subprocess.run(["systemctl", "--user", "reset-failed", UNIT], capture_output=True)
+    done = subprocess.run(["systemd-run", "--user", f"--unit={UNIT}", "--collect",
+                           f"--description=T3 SISO update (T3 offered {args.offered})",
+                           "--property=RuntimeMaxSec=4h", "--setenv=PYTHONUNBUFFERED=1",
+                           f"--setenv=PATH={os.environ.get('PATH', '')}:{HOME / '.local/bin'}",
+                           sys.executable, str(Path(__file__).resolve()), "run", "--offered", args.offered],
+                          capture_output=True, text=True)
+    print((done.stdout + done.stderr).strip())
+    return done.returncode
+
+
+def cmd_status(_args):
+    state = load_state()
+    print(json.dumps(state.get("last", {}), indent=2))
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    run = sub.add_parser("run")
+    run.add_argument("--nightly", help="upstream tag to build (default: the newest nightly)")
+    run.add_argument("--offered", help="the version T3 offered, for the log")
+    run.add_argument("--no-switch", action="store_true", help="build, but do not arm the switch")
+    run.add_argument("--no-push", action="store_true", help="do not push branches or tags to the fork")
+    run.add_argument("--force", action="store_true", help="run even if these inputs were already built or failed")
+    run.add_argument("--wake", help="thread for the result and the switch's report (default stack.json notify_thread)")
+    trigger = sub.add_parser("trigger")
+    trigger.add_argument("--offered", required=True)
+    sub.add_parser("status")
+    args = parser.parse_args()
+    return {"run": cmd_run, "trigger": cmd_trigger, "status": cmd_status}[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

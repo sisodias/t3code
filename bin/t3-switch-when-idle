@@ -1,0 +1,1162 @@
+#!/usr/bin/env python3
+"""Switch the running T3 Code app to another build once the number of busy runs stays within a limit.
+
+Shaan, 19 Nov 2026: "I don't like how the messages queue. They should just be instantly sent through."
+The no-queue build fixes that, but swapping the app stops any turn that is running, so this waits for a quiet
+moment, swaps the app itself, and rolls back if the new build does not come up.
+
+  t3-switch-when-idle arm  [--to noqueue|livebg|PATH] [--max-busy N] [--wake THREAD]   start `run` once as a transient systemd user unit (outlives T3)
+  t3-switch-when-idle run  [--to noqueue|livebg|PATH] [--max-busy N] [--wake THREAD]   the job: wait, switch, quit, start, check, roll back if needed, wake
+  --to PATH (24 Nov 2026) is any AppImage, such as one t3-siso-update built; `arm` pins its sha256 and rolls back to
+  the build T3 is running at arm time (or --rollback-to PATH).
+  livebg (24 Nov 2026) is noqueue plus a theme's live background page; it rolls back to noqueue. --wake sends the
+  result to that thread instead of Agent Zero (a job that armed the switch wakes itself).
+  t3-switch-when-idle idle                  runs mid-turn right now (read-only); exit 0 idle, 1 busy
+  t3-switch-when-idle prove                 all three paths on a second T3 (own home, port, hidden windows); live untouched
+  --instance FILE (run, idle) points every step at a test instance instead of the live app.
+
+`run`, step by step:
+ 1. One wait: until at most --max-busy runs (default 0) are preparing, starting, running or waiting for 90 s
+    in a row, read from statev2.sqlite opened mode=ro + query_only. Gives up after 6 h. It never re-arms.
+    When armed from a T3 turn, that thread must also be idle.
+ 2. switch.sh <to>: the menu entries and the Touch Bar key point at the target build.
+ 3. Record the busy threads just before sending SIGTERM to T3's Electron main process, found by PID (parent of the server on T3's port, and of the Chromium
+    children started with T3's --user-data-dir), never by name. The app's SIGTERM handler runs the same shutdown
+    as Ctrl+Q (DesktopLifecycle.ts: flush window bounds, stop the backend and its agent sessions, then quit).
+    Not gone in 60 s: switch.sh back and signal nothing more; if it finishes quitting within 10 more min, start
+    the old build and check it as in step 5, so a slow quit never leaves the laptop with no T3.
+ 4. Starts the target through Hyprland with uwsm-app, as Omarchy's launchers do, from the menu entry's Exec line,
+    HIDDEN: on a special workspace, silent, no initial focus, no focus on activation (Omarchy turns
+    misc:focus_on_activate on, and T3 activates its window, which would open that special workspace over the screen).
+    A keeper on Hyprland's event socket moves any later window of that app (a "could not start" window, a dialog)
+    into hiding too and closes the hidden workspace if anything shows it.
+ 5. Healthy within 120 s: a window owned by the new main process, /.well-known/t3/environment answers on T3's port,
+    and that server is the new app's child running from the target AppImage (sha256 pinned below; both builds
+    report the same serverVersion). Not healthy: switch.sh back, quit what came up, start the other build, check it.
+    Only then is the final window shown: moved to the workspace the old window was on (focused if the old one was),
+    with focus_on_activate set back to the global value. A failed start is never on screen.
+ 6. After a healthy start, send one auto resume message to each cut thread. Wake Agent Zero with the result
+    of the switch and each resume send.
+ 7. Every step is logged with UTC times to ~/.local/state/t3-switch/<start>-<to>.log (and the unit's journal).
+"""
+import argparse
+import base64
+import datetime as dt
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from contextlib import closing, contextmanager
+from pathlib import Path
+
+HOME = Path.home()
+T3CODE = HOME / ".local/share/t3code"
+BUILDS = {
+    "noqueue": (T3CODE / "nightly-0.1.11-20261117.4825-noqueue/T3-Code-Nightly-arm64.AppImage",
+                "a0e62f2078611ec4bfc820464c7d5bf5d03b455fbaced4a4907ea9335e5dea42"),
+    "stock": (T3CODE / "nightly-0.1.11-20261117.4825/T3-Code-Nightly-arm64.AppImage",
+              "83ec84782e7a7e0982dea3f64a9b8bde1af8a9446aa798eb4c019cf12b17928e"),
+    "livebg": (T3CODE / "nightly-0.1.11-20261117.4825-livebg/T3-Code-Nightly-arm64.AppImage",
+               "3cb7e932d101a89e10ecb5cba237da1249c8f381445c6b54251d1d23b72b90f7"),
+}
+ROLLBACK = {"noqueue": "stock", "stock": "noqueue", "livebg": "noqueue"}
+# Builds named by path (--to PATH); switch.sh gets their path instead of a name.
+BY_PATH = set()
+SWITCH = Path(__file__).resolve().parent / "t3-switch-launchers"
+AGENT_ZERO = "mcp:launch:c2c020beb76b5d8fed3d349cf41caca797f486e1d2a2662caebec2314a656d82"
+ACTIVE = ("preparing", "starting", "running", "waiting")
+UNIT = "t3-switch-noqueue"
+LIVE = {
+    "name": "live",
+    "home": str(HOME),
+    "t3home": str(HOME / ".t3"),
+    "port": 3773,
+    "userdata": str(HOME / ".config/t3code-v2"),
+    "app_env": {},
+    "hidden_ws": "special:t3switch",
+    "show_ws": None,
+    "switch": str(SWITCH),
+    "switch_env": {},
+    "cli": str(HOME / ".t3/bin/t3"),
+    "wake": [str(HOME / ".t3/bin/t3"), "thread", "send", AGENT_ZERO],
+    "log_dir": str(HOME / ".local/state/t3-switch"),
+    "quiet_s": 90,
+    "max_busy": 0,
+    "arming_thread": None,
+    "give_up_s": 6 * 3600,
+    "quit_s": 60,
+    "late_quit_s": 600,
+    "health_s": 120,
+    "poll_s": 5,
+    "break_env": {},
+}
+
+
+def utc(offset_s=0):
+    t = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=offset_s)
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def load_config(instance):
+    cfg = dict(LIVE)
+    if instance is None:
+        return cfg
+    cfg.update(json.loads(Path(instance).read_text()))
+    # A test instance must never point at the live app, its database or its windows.
+    live = (cfg["name"] == "live" or int(cfg["port"]) == LIVE["port"] or cfg["userdata"] == LIVE["userdata"]
+            or Path(cfg["t3home"]).resolve() == Path(LIVE["t3home"]).resolve()
+            or Path(cfg["home"]).resolve() == HOME.resolve())
+    if live:
+        sys.exit(f"{instance}: a test instance needs its own name, port, userdata, T3 home and HOME")
+    if not (str(cfg["hidden_ws"]).startswith("special:") and str(cfg["show_ws"]).startswith("special:")):
+        sys.exit(f"{instance}: a test instance's windows stay on special workspaces (hidden_ws and show_ws)")
+    return cfg
+
+
+class Log:
+    def __init__(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.file = open(path, "a", buffering=1)
+        self.lock = threading.Lock()
+
+    def __call__(self, step, message):
+        line = f"{utc()} {step:<8} {message}"
+        with self.lock:
+            print(line, flush=True)
+            self.file.write(line + "\n")
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# ---------- T3's database (read-only) ----------
+
+def state_db(cfg):
+    db = Path(cfg["t3home"]) / "userdata/statev2.sqlite"
+    con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
+    con.execute("pragma query_only = 1")
+    return con
+
+
+def active_runs(cfg):
+    with closing(state_db(cfg)) as con:
+        marks = ",".join("?" * len(ACTIVE))
+        return con.execute(
+            "select r.run_id, r.thread_id, r.status, r.requested_at, coalesce(t.title, r.thread_id)"
+            " from orchestration_v2_projection_runs r"
+            " left join orchestration_v2_projection_threads t on t.thread_id = r.thread_id"
+            f" where r.status in ({marks}) order by r.requested_at", ACTIVE).fetchall()
+
+
+def describe_runs(runs):
+    shown = ", ".join(f"{t[-12:]}:{s}" for _, t, s, _, _ in runs[:5])
+    return f"{len(runs)} run(s) mid-turn ({shown}{', ...' if len(runs) > 5 else ''})"
+
+
+def within_busy_limit(cfg, runs):
+    return len(runs) <= cfg["max_busy"] and all(run[1] != cfg["arming_thread"] for run in runs)
+
+
+def wait_idle(cfg, log, attempt_switch):
+    start = time.monotonic()
+    quiet_since = None
+    last = None
+    next_beat = start + 600
+    while True:
+        try:
+            runs = active_runs(cfg)
+            state = describe_runs(runs) if runs else "idle: no run mid-turn"
+            ready = within_busy_limit(cfg, runs)
+            key = tuple((r[0], r[2]) for r in runs)
+        except sqlite3.Error as exc:
+            state, key, ready = f"cannot read T3's database ({exc})", ("error",), False
+        now = time.monotonic()
+        if not ready:
+            quiet_since = None
+        elif quiet_since is None:
+            quiet_since = now
+        if key != last:
+            log("wait", f"{state}; " + (f"within max-busy {cfg['max_busy']}, need {cfg['quiet_s']} s in a row"
+                                       if ready else f"waiting for max-busy {cfg['max_busy']} and arming thread idle"))
+            last = key
+        if now - start >= cfg["give_up_s"]:
+            log("wait", f"gave up after {cfg['give_up_s'] // 3600} h ({state})")
+            return None
+        if quiet_since is not None and now - quiet_since >= cfg["quiet_s"]:
+            log("wait", f"within max-busy {cfg['max_busy']} for {cfg['quiet_s']} s after {int(now - start)} s of waiting")
+            result = attempt_switch(now - start)
+            if result is not None:
+                return result
+            quiet_since = None
+        if now >= next_beat:
+            log("wait", f"still waiting after {int(now - start) // 60} min: {state}")
+            next_beat += 600
+        time.sleep(cfg["poll_s"])
+
+
+# ---------- processes, the server and Hyprland ----------
+
+def processes():
+    table = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            argv = [a.decode(errors="replace") for a in Path(f"/proc/{entry}/cmdline").read_bytes().split(b"\0") if a]
+            fields = Path(f"/proc/{entry}/stat").read_text().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        if fields[0] != "Z":
+            table[int(entry)] = (int(fields[1]), argv)
+    return table
+
+
+def is_main(argv):
+    """The Electron browser process of an AppImage T3: not a Chromium child, not the server or a node helper.
+    Chromium rewrites its children's command line into one space-joined string, so match on the joined line."""
+    words = " ".join(argv).split(" ")
+    return (bool(argv) and words[0].endswith("/t3code") and "/.mount_" in words[0]
+            and not any(w.startswith("--type=") or w == "--require" or w.endswith((".mjs", ".cjs", ".js"))
+                        for w in words[1:]))
+
+
+def is_child_of_instance(argv, userdata):
+    """A Chromium child of a T3 app started with this instance's --user-data-dir (its argv is one joined string)."""
+    words = " ".join(argv).split(" ")
+    return words[0].endswith("/t3code") and f"--user-data-dir={userdata}" in words
+
+
+def server_pid(port):
+    out = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"], capture_output=True, text=True).stdout
+    found = re.search(r"pid=(\d+)", out)
+    return int(found.group(1)) if found else None
+
+
+def find_mains(cfg):
+    table = processes()
+    mains = set()
+    for _, (ppid, argv) in table.items():
+        if argv and is_child_of_instance(argv, cfg["userdata"]):
+            parent, hops = ppid, 0
+            while parent in table and hops < 6:
+                if is_main(table[parent][1]):
+                    mains.add(parent)
+                    break
+                parent, hops = table[parent][0], hops + 1
+    server = server_pid(cfg["port"])
+    if server in table and table[server][0] in table and is_main(table[table[server][0]][1]):
+        mains.add(table[server][0])
+    return mains, server, table
+
+
+def alive(pid):
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def appimage_of(pid):
+    try:
+        for item in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+            if item.startswith(b"APPIMAGE="):
+                return item[9:].decode(errors="replace")
+    except OSError:
+        pass
+    return None
+
+
+def server_info(port):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/.well-known/t3/environment", timeout=3) as reply:
+            return json.loads(reply.read())
+    except (OSError, ValueError):
+        return None
+
+
+def hypr_env():
+    env = dict(os.environ)
+    runtime = Path(env.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "hypr"
+    signature = env.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    if not (runtime / signature / ".socket.sock").exists():
+        sockets = sorted(runtime.glob("*/.socket.sock"), key=lambda p: p.stat().st_mtime)
+        if sockets:
+            env["HYPRLAND_INSTANCE_SIGNATURE"] = sockets[-1].parent.name
+    return env
+
+
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True, env=hypr_env(), timeout=15)
+
+
+def window_of(pid):
+    try:
+        clients = json.loads(hyprctl("clients", "-j").stdout or "[]")
+    except (ValueError, subprocess.SubprocessError, OSError):
+        return None
+    for client in clients:
+        if client.get("pid") == pid:
+            return client
+    return None
+
+
+def lua_string(text):
+    return json.dumps(text, ensure_ascii=True)
+
+
+# ---------- the steps ----------
+
+def register(path, pinned=None):
+    """Adds the AppImage at `path` to BUILDS under its folder's name; returns that name."""
+    path = Path(path).resolve()
+    name = next((n for n, (p, _) in BUILDS.items() if p.resolve() == path), None)
+    if name is None:
+        name = path.parent.name
+        BUILDS[name] = (path, pinned or sha256(path))
+        BY_PATH.add(name)
+    return name
+
+
+def resolve_build(value, pinned=None):
+    if value in BUILDS:
+        return value
+    if not (value.startswith("/") and value.endswith(".AppImage") and Path(value).is_file()):
+        sys.exit(f"--to {value}: not a build name ({', '.join(sorted(BUILDS))}) or an existing absolute .AppImage path")
+    return register(value, pinned)
+
+
+def running_appimage(cfg):
+    server = server_pid(cfg["port"])
+    return appimage_of(server) if server else None
+
+
+def switch(cfg, log, which):
+    env = hypr_env()
+    env.update(cfg["switch_env"])
+    target = str(BUILDS[which][0]) if which in BY_PATH else which
+    try:
+        done = subprocess.run(["/bin/sh", cfg["switch"], target], env=env, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("switch", f"switch.sh {which} could not run: {exc}")
+        return False
+    said = " | ".join(line for line in (done.stdout + done.stderr).splitlines() if line.strip())
+    log("switch", f"switch.sh {which} -> exit {done.returncode}: {said}")
+    return done.returncode == 0
+
+
+def quit_app(cfg, log, label, stall_escape=False, before_signal=None):
+    """SIGTERM to T3's main process by PID; True once the main, its server and the port are all gone."""
+    mains, server, table = find_mains(cfg)
+    if not mains:
+        log("quit", f"{label}: no T3 main process for this instance")
+        return True, 0.0, None
+    if len(mains) > 1:
+        log("quit", f"{label}: more than one T3 main process {sorted(mains)}; signalling none")
+        return False, 0.0, None
+    main = mains.pop()
+    window = window_of(main)
+    workspace = window["workspace"] if window else None
+    if before_signal and not before_signal():
+        return None, 0.0, window
+    log("quit", f"{label}: SIGTERM to T3's main process {main} ({table[main][1][0]}), server {server}, "
+                f"window {'on workspace ' + workspace['name'] if workspace else 'none'}")
+    began = time.monotonic()
+    os.kill(main, signal.SIGTERM)
+    escaped = False
+    while time.monotonic() - began < cfg["quit_s"]:
+        time.sleep(1)
+        listening = server_pid(cfg["port"])
+        if not alive(main) and not (server and alive(server)) and listening is None:
+            took = time.monotonic() - began
+            log("quit", f"{label}: gone in {took:.0f} s (main {main} and server {server} exited, port {cfg['port']} closed)")
+            return True, took, window
+        if stall_escape and not escaped and time.monotonic() - began >= 15:
+            # The app's own way out of a stalled quit: a repeated SIGTERM after 10 s exits it (DesktopLifecycle.ts).
+            log("quit", f"{label}: still up after 15 s; a second SIGTERM, the app's own exit for a stalled quit")
+            if alive(main):
+                os.kill(main, signal.SIGTERM)
+            escaped = True
+    log("quit", f"{label}: still there after {cfg['quit_s']} s (main alive {alive(main)}, "
+                f"server alive {bool(server and alive(server))}, port open {server_pid(cfg['port']) is not None})")
+    return False, cfg["quit_s"], window
+
+
+def wait_gone(cfg, seconds):
+    """Wait for an app that is already quitting: no main process for this instance and T3's port closed."""
+    began = time.monotonic()
+    while True:
+        if not find_mains(cfg)[0] and server_pid(cfg["port"]) is None:
+            return True, time.monotonic() - began
+        if time.monotonic() - began >= seconds:
+            return False, seconds
+        time.sleep(2)
+
+
+def exec_line(desktop):
+    try:
+        for line in desktop.read_text().splitlines():
+            if line.startswith("Exec="):
+                return [a for a in shlex.split(line[5:]) if not re.fullmatch(r"%[a-zA-Z]", a)]
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def start(cfg, log, which, extra_env=None):
+    """Start a build hidden (see step 4); only reveal() puts a window where it can be seen."""
+    path = str(BUILDS[which][0])
+    left = find_mains(cfg)[0]
+    if left:
+        # A second start would only hand its arguments to this one through Electron's single-instance lock.
+        log("start", f"{which}: not started, T3 main process {sorted(left)} is still running for this instance")
+        return False
+    desktop = Path(cfg["home"]) / ".local/share/applications/t3code.desktop"
+    argv = exec_line(desktop)
+    # The menu entry may start with `env K=V ...` (T3 Connect's public settings); keep those for the app.
+    menu_env = {}
+    if argv and argv[0] == "env":
+        argv = argv[1:]
+        while argv and "=" in argv[0] and not argv[0].startswith("/"):
+            key, _, value = argv.pop(0).partition("=")
+            menu_env[key] = value
+    if not argv or argv[0] != path:
+        log("start", f"{desktop} Exec is {argv}, not the {which} build; starting {path} directly")
+        argv = [path]
+    env = {**menu_env, **cfg["app_env"], **(extra_env or {})}
+    command = "uwsm-app -- " + shlex.join((["env", *[f"{k}={v}" for k, v in env.items()]] if env else []) + argv)
+    rules = f"{{ workspace = {lua_string(cfg['hidden_ws'] + ' silent')}, no_initial_focus = true, focus_on_activate = false }}"
+    dispatch = f"hl.dsp.exec_cmd({lua_string(command)}, {rules})"
+    done = hyprctl("dispatch", dispatch)
+    log("start", f"{which}: hyprctl dispatch {dispatch} -> {(done.stdout + done.stderr).strip()}")
+    return done.returncode == 0
+
+
+def belongs(cfg, pid):
+    """A window of this instance's T3: its pid is the instance's Electron main, found by --user-data-dir. (Chromium
+    overwrites the main's own command line and environment block, so neither can be read from /proc.)"""
+    return pid in find_mains(cfg)[0]
+
+
+class Keeper:
+    """While an app of this instance starts, keep its windows off the screen. Listens to Hyprland's event socket:
+    a window of the instance that opens outside the hidden workspace is moved into it, and the hidden workspace is
+    closed if anything shows it. Each of those, and the instance's window taking focus, is an incident."""
+
+    def __init__(self, cfg, log, act=True):
+        self.cfg, self.log, self.act = cfg, log, act
+        self.hidden = cfg["hidden_ws"]
+        self.watched = {w for w in (cfg["hidden_ws"], cfg["show_ws"]) if w and str(w).startswith("special:")}
+        self.incidents, self.released = [], set()
+        self.sock = socket.socket(socket.AF_UNIX)
+        env = hypr_env()
+        path = (Path(env.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "hypr"
+                / env.get("HYPRLAND_INSTANCE_SIGNATURE", "") / ".socket2.sock")
+        try:
+            self.sock.connect(str(path))
+        except OSError as exc:
+            log("keep", f"no Hyprland event socket ({exc}); the launch rules alone keep the windows hidden")
+            self.sock = None
+            return
+        log("keep", f"keeping this instance's new windows on {self.hidden} (act {act})")
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def release(self, address):
+        self.released.add(address.removeprefix("0x"))
+
+    def stop(self):
+        if self.sock:
+            sock, self.sock = self.sock, None
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+
+    def _loop(self):
+        sock, buf = self.sock, b""
+        while self.sock is sock:
+            try:
+                chunk = sock.recv(65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                try:
+                    self._event(line.decode(errors="replace"))
+                except Exception as exc:  # a bad event must never stop the keeper
+                    self.log("keep", f"event {line[:80]!r}: {exc}")
+
+    def _ours(self, address):
+        if address in self.released and self.cfg["name"] == "live":
+            return None  # the final live window is Shaan's again; a test window never is
+        try:
+            clients = json.loads(hyprctl("clients", "-j").stdout or "[]")
+        except (ValueError, subprocess.SubprocessError, OSError):
+            return None
+        client = next((c for c in clients if c.get("address", "").removeprefix("0x") == address), None)
+        return client if client and belongs(self.cfg, client.get("pid")) else None
+
+    def _event(self, line):
+        name, _, data = line.partition(">>")
+        if name == "openwindow":
+            address, workspace = data.split(",")[:2]
+            if workspace not in self.watched and self._ours(address):
+                self.incidents.append(f"{utc()} window {address} opened on {workspace}")
+                self.log("keep", f"window 0x{address} of this instance opened on {workspace}; "
+                                 f"{'moving it to ' + self.hidden if self.act else 'recorded'}")
+                if self.act:
+                    hyprctl("dispatch", f"hl.dsp.window.move({{ workspace = {lua_string(self.hidden)}, follow = false, "
+                                        f"window = \"address:0x{address}\" }})")
+        elif name == "activewindowv2" and data and self._ours(data):
+            self.incidents.append(f"{utc()} window {data} took focus")
+            self.log("keep", f"window 0x{data} of this instance took focus")
+        elif name == "activespecial" and data.split(",")[0] in self.watched:
+            special, monitor = data.split(",")[0], data.split(",")[-1]
+            self.incidents.append(f"{utc()} {special} shown on {monitor}")
+            self.log("keep", f"{special} was shown on {monitor}; {'closing it' if self.act else 'recorded'}")
+            if self.act:
+                shown = json.loads(hyprctl("monitors", "-j").stdout or "[]")
+                if any(m.get("specialWorkspace", {}).get("name") == special for m in shown):
+                    hyprctl("dispatch", f"hl.dsp.workspace.toggle_special({lua_string(special.removeprefix('special:'))})")
+
+
+def reveal(cfg, log, keeper, which, old_window):
+    """Show the final app window: on show_ws (a test), else where the old window was (focused if it was)."""
+    mains, _, _ = find_mains(cfg)
+    main = next(iter(mains)) if len(mains) == 1 else None
+    window = window_of(main) if main else None
+    if not window:
+        log("show", f"{which}: no window to show")
+        return False
+    keeper.release(window["address"])
+    focus = False
+    if cfg["show_ws"]:
+        target = cfg["show_ws"]
+    elif old_window:
+        ws = old_window["workspace"]
+        target = ws["name"] if str(ws.get("name", "")).startswith("special:") else str(ws["id"])
+        focus = old_window.get("focusHistoryID") == 0
+    else:
+        target = str(json.loads(hyprctl("activeworkspace", "-j").stdout or "{}").get("id", 1))
+    on = "1" if re.search(r"bool: true|int: 1", hyprctl("getoption", "misc:focus_on_activate").stdout) else "0"
+    address = f"address:{window['address']}"
+    steps = [f"hl.dsp.window.move({{ workspace = {lua_string(target)}, follow = false, window = \"{address}\" }})"]
+    if cfg["show_ws"]:
+        on = "0 (a test window keeps it off)"
+    else:
+        steps.insert(0, f'hl.dsp.window.set_prop({{ prop = "focus_on_activate", value = "{on}", window = "{address}" }})')
+    if focus:
+        steps.append(f'hl.dsp.focus({{ window = "{address}" }})')
+    said = [(lambda d: (d.stdout + d.stderr).strip())(hyprctl("dispatch", step)) for step in steps]
+    now = window_of(main)
+    where = now["workspace"]["name"] if now else "gone"
+    ok = where == target or (now and str(now["workspace"].get("id")) == target)
+    log("show", f"{which}: window {window['address']} moved from {window['workspace']['name']} to {target}"
+                f"{' and focused' if focus else ''}, focus_on_activate {on} ({', '.join(said)}); now on {where}")
+    return bool(ok)
+
+
+def health(cfg, which):
+    mains, server, table = find_mains(cfg)
+    main = next(iter(mains)) if len(mains) == 1 else None
+    window = window_of(main) if main else None
+    info = server_info(cfg["port"]) if server else None
+    image = appimage_of(server) if server else None
+    build = next((name for name, (p, _) in BUILDS.items() if str(p) == image), image or "unknown")
+    own = bool(server and main and table.get(server, (None,))[0] == main)
+    ok = bool(window and info and own and build == which)
+    summary = (f"main {main or sorted(mains) or 'none'}; window {'yes on ' + window['workspace']['name'] if window else 'no'}; "
+               f"server {server or 'none'} answers {'yes, serverVersion ' + str(info.get('serverVersion')) if info else 'no'}; "
+               f"server is this app's child {'yes' if own else 'no'}; server runs the {build} build")
+    return ok, summary, bool(window)
+
+
+def wait_healthy(cfg, log, which, began):
+    last, window_at = None, None
+    while True:
+        ok, summary, window = health(cfg, which)
+        elapsed = time.monotonic() - began
+        if window and window_at is None:
+            window_at = elapsed
+            log("health", f"{which}: window up {elapsed:.0f} s after start")
+        if ok:
+            log("health", f"{which}: healthy {elapsed:.0f} s after start: {summary}")
+            return True, elapsed, window_at
+        if summary != last:
+            log("health", f"{which} at {elapsed:.0f} s: {summary}")
+            last = summary
+        if elapsed >= cfg["health_s"]:
+            log("health", f"{which}: not healthy within {cfg['health_s']} s: {summary}")
+            return False, elapsed, window_at
+        time.sleep(2)
+
+
+def wake(cfg, log, message):
+    log("wake", message)
+    for attempt in range(1, 7):
+        try:
+            done = subprocess.run([*cfg["wake"], message], capture_output=True, text=True, timeout=90)
+            said = (done.stdout + done.stderr).strip().replace("\n", " | ")[:300]
+            if done.returncode == 0:
+                log("wake", f"sent (attempt {attempt}): {said}")
+                return True
+            log("wake", f"attempt {attempt}: exit {done.returncode}: {said}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            log("wake", f"attempt {attempt}: {exc}")
+        time.sleep(10)
+    log("wake", "could not reach Agent Zero; the log above is the record")
+    if cfg["name"] == "live":
+        subprocess.run(["notify-send", "-u", "critical", "T3 Code switch", message[:400]], env=hypr_env())
+    return False
+
+
+def t3_cli(cfg, *args, extra_env=None):
+    env = {**os.environ, **cfg["app_env"], **(extra_env or {})}
+    return subprocess.run([cfg["cli"], *args], capture_output=True, text=True, timeout=30, env=env)
+
+
+@contextmanager
+def resume_session(cfg, log):
+    """Use T3's loopback MCP approval flow so sends can reach threads of every runtime mode."""
+    base = ("--base-dir", cfg["t3home"])
+    flow = secrets.token_urlsafe(32)
+    label = "T3 switch resume " + secrets.token_hex(6)
+    conn = http.client.HTTPConnection("127.0.0.1", cfg["port"], timeout=15)
+
+    def post(path, payload, bearer=None, form=False):
+        headers = {"Content-Type": "application/x-www-form-urlencoded" if form else "application/json"}
+        if bearer:
+            headers["Authorization"] = f"Bearer {bearer}"
+        conn.request("POST", path, urllib.parse.urlencode(payload) if form else json.dumps(payload), headers)
+        with conn.getresponse() as response:
+            body = response.read()
+            if response.status not in (200, 201):
+                raise ValueError(f"{path} returned HTTP {response.status}")
+            return json.loads(body)
+
+    bootstrap = None
+    exchanged = False
+    try:
+        issued = t3_cli(cfg, "auth", "session", "issue", *base, "--ttl", "5m", "--label", label + " approval",
+                        "--scope", "access:write", "--scope", "orchestration:read", "--scope", "orchestration:operate",
+                        "--scope", "settings:write", "--scope", "source-control:write", "--json")
+        if issued.returncode != 0:
+            raise ValueError(f"session issue exited {issued.returncode}")
+        bootstrap = json.loads(issued.stdout)
+        redirect = f"http://127.0.0.1:{cfg['port']}/t3-switch-resume"
+        resource = f"http://127.0.0.1:{cfg['port']}/mcp"
+        client = post("/oauth/mcp/register", {"client_name": label, "redirect_uris": [redirect]})
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(flow.encode()).digest()).decode().rstrip("=")
+        auth = {"response_type": "code", "client_id": client["client_id"], "redirect_uri": redirect,
+                "code_challenge_method": "S256", "code_challenge": challenge, "resource": resource}
+        approval = post("/oauth/mcp/approval", auth, bootstrap["token"])
+        decision = {"_tag": "browser-session", "access": "full-access", "csrfToken": approval["csrfToken"]}
+        approved = post("/oauth/mcp/decision", {"authorization": auth, "decision": decision}, bootstrap["token"])
+        code = urllib.parse.parse_qs(urllib.parse.urlsplit(approved["redirectTo"]).query)["code"][0]
+        exchanged = True  # Look for a session even if the exchange succeeded but its reply was lost.
+        token = post("/oauth/mcp/token", {"grant_type": "authorization_code", "code": code,
+                                        "redirect_uri": redirect, "client_id": client["client_id"],
+                                        "code_verifier": flow, "resource": resource}, form=True)
+        yield {"T3_ACP_MCP_ENDPOINT": resource, "T3_ACP_MCP_AUTHORIZATION": f"Bearer {token['access_token']}"}
+    finally:
+        conn.close()
+        def revoke(session_id):
+            try:
+                revoked = t3_cli(cfg, "auth", "session", "revoke", *base, session_id)
+                if revoked.returncode != 0:
+                    raise ValueError("session revoke failed")
+            except (OSError, subprocess.SubprocessError, ValueError):
+                log("resume", f"could not revoke a {label} session")
+
+        if bootstrap:
+            revoke(bootstrap["sessionId"])
+        if exchanged:
+            try:
+                listed = t3_cli(cfg, "auth", "session", "list", *base, "--json")
+                if listed.returncode != 0:
+                    raise ValueError("session list failed")
+                for session in json.loads(listed.stdout):
+                    if session.get("subject") == "mcp-client" and session.get("client", {}).get("label") == label:
+                        revoke(session["sessionId"])
+            except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+                log("resume", f"could not find the {label} session to revoke")
+
+
+def cut_summary(cfg, log, cut, running_build=None, rolled_back=False):
+    if not cut:
+        return "Cut threads: none."
+    if not running_build:
+        return "Cut threads (resume skipped, no healthy restart): " + ", ".join(
+            f"{title!r} ({thread})" for thread, title in cut.items())
+    # This nightly's `t3 thread send` hard-codes queue. Its bundled MCP client can request auto.
+    accepted = set()
+    clock = subprocess.check_output(["date", "-u", "+%H:%MZ"], text=True).strip()
+    restart = f"is back on {running_build}" if rolled_back else f"restarted onto the {running_build} build"
+    message = (f"[from Agent Zero] T3 {restart} at {clock} and cut your turn. Carry on from where you were; "
+               "check the state of anything you were writing or pushing before you redo it.")
+    try:
+        with resume_session(cfg, log) as env:
+            for thread in cut:
+                try:
+                    args = json.dumps({"threadId": thread, "message": message, "mode": "auto"})
+                    sent = t3_cli(cfg, "acp-mcp-call", "t3_thread_send", args, extra_env=env)
+                    reply = json.loads(sent.stdout) if sent.returncode == 0 else {}
+                    receipt = reply.get("structuredContent") or {}
+                    if not reply.get("isError") and receipt.get("threadId") == thread and receipt.get("messageId"):
+                        accepted.add(thread)
+                    else:
+                        log("resume", f"{thread}: CLI exit {sent.returncode}, MCP error {bool(reply.get('isError'))}")
+                except (OSError, subprocess.SubprocessError, ValueError, AttributeError) as exc:
+                    log("resume", f"{thread}: no receipt ({type(exc).__name__})")
+    except (OSError, subprocess.SubprocessError, http.client.HTTPException, ValueError, KeyError) as exc:
+        # HTTP status and exception type are enough to diagnose auth failures without logging credentials.
+        detail = str(exc) if type(exc) is ValueError else type(exc).__name__
+        log("resume", f"could not open resume session: {detail}")
+    receipts = []
+    for thread, title in cut.items():
+        receipt = f"{title!r} ({thread}): resume {'accepted' if thread in accepted else 'not confirmed'}"
+        log("resume", receipt)
+        receipts.append(receipt)
+    return "Cut threads: " + ", ".join(receipts)
+
+
+def run(cfg, to, log, other=None):
+    other = other or ROLLBACK[to]
+    log("begin", f"switch T3 ({cfg['name']}, port {cfg['port']}) to the {to} build once at most {cfg['max_busy']} run(s) are mid-turn for "
+                 f"{cfg['quiet_s']} s; one wait, gives up at {utc(cfg['give_up_s'])}; log {log.path}")
+    log("begin", f"new windows start hidden on {cfg['hidden_ws']}; the final one is shown on "
+                 f"{cfg['show_ws'] or 'the workspace the old T3 window was on'}")
+    for name in (to, other):
+        path, pinned = BUILDS[name]
+        log("begin", f"{name}: {path} sha256 {'matches' if path.exists() and sha256(path) == pinned else 'DOES NOT MATCH'} {pinned[:12]}")
+    if not BUILDS[to][0].exists() or sha256(BUILDS[to][0]) != BUILDS[to][1]:
+        wake(cfg, log, f"T3 switch not started: the {to} AppImage is missing or its sha256 is not {BUILDS[to][1][:12]}. Nothing changed. Log: {log.path}")
+        return 4
+
+    def attempt_switch(waited):
+        if sha256(BUILDS[to][0]) != BUILDS[to][1]:
+            wake(cfg, log, f"T3 switch stopped before quitting: the {to} AppImage changed during the wait. Nothing changed. Log: {log.path}")
+            return 4
+        keeper = Keeper(cfg, log)
+        try:
+            return switch_now(cfg, to, other, log, keeper, waited)
+        finally:
+            keeper.stop()
+            if keeper.incidents:
+                log("keep", f"{len(keeper.incidents)} incident(s): {'; '.join(keeper.incidents)}")
+
+    result = wait_idle(cfg, log, attempt_switch)
+    if result is None:
+        wake(cfg, log, f"T3 switch gave up: in {cfg['give_up_s'] // 3600} h T3 never had {cfg['quiet_s']} s in a row "
+                       f"within max-busy {cfg['max_busy']} with the arming thread idle. Still on {other}. Log: {log.path}")
+        return 3
+    return result
+
+
+def back_to(cfg, log, keeper, which, old_window):
+    """Start `which` hidden, check it, show its window whatever the result (the laptop must not be left without T3)."""
+    restarted = time.monotonic()
+    start(cfg, log, which)
+    ok, after, _ = wait_healthy(cfg, log, which, restarted)
+    reveal(cfg, log, keeper, which, old_window)
+    return ok, after
+
+
+def switch_now(cfg, to, other, log, keeper, waited):
+    began = time.monotonic()
+    if not switch(cfg, log, to):
+        switch(cfg, log, other)
+        wake(cfg, log, f"T3 switch stopped: switch.sh {to} failed, so T3 was not quit (still {other}). Log: {log.path}")
+        return 4
+    cut = {}
+
+    def record_cut():
+        try:
+            runs = active_runs(cfg)
+        except sqlite3.Error as exc:
+            log("wait", f"cannot recheck busy runs before quit ({exc}); staying on {other}")
+            return False
+        if not within_busy_limit(cfg, runs):
+            log("wait", f"threshold changed before quit ({describe_runs(runs)}); staying on {other}")
+            return False
+        for run_id, thread, status, _, title in runs:
+            cut[thread] = title
+            log("cut", f"busy run {run_id} ({status}): {title!r} ({thread})")
+        return True
+
+    quit_ok, quit_took, old_window = quit_app(cfg, log, f"old {other} app", before_signal=record_cut)
+    if quit_ok is None:
+        if switch(cfg, log, other):
+            return None  # The same wait continues with a fresh quiet interval.
+        wake(cfg, log, f"T3 switch stopped: could not restore the {other} launchers. T3 was not quit. Log: {log.path}")
+        return 4
+    if not quit_ok:
+        switch(cfg, log, other)
+        log("rollback", f"the {other} app did not quit within {cfg['quit_s']} s; launchers back on {other}, the {to} build not "
+                        f"started, no further signal; waiting up to {cfg['late_quit_s']} s for it to finish quitting")
+        gone, late = wait_gone(cfg, cfg["late_quit_s"])
+        if not gone:
+            ok, summary, _ = health(cfg, other)
+            wake(cfg, log, f"T3 switch stopped: the {other} app had not quit {cfg['quit_s'] + late:.0f} s after it was asked to, so the "
+                           f"launchers went back to {other} and nothing new was started. Now: {'healthy' if ok else 'NOT healthy'}: "
+                           f"{summary}. {cut_summary(cfg, log, cut)} Log: {log.path}")
+            return 5
+        log("rollback", f"the {other} app finished quitting {cfg['quit_s'] + late:.0f} s after it was asked to; starting {other}")
+        ok, back_after = back_to(cfg, log, keeper, other, old_window)
+        resumes = cut_summary(cfg, log, cut, other if ok else None, rolled_back=True)
+        wake(cfg, log, f"T3 switch rolled back: the {other} app took {cfg['quit_s'] + late:.0f} s to quit (limit {cfg['quit_s']} s), so "
+                       f"the {to} build was not started and T3 Code is running the {other} build again "
+                       f"({'healthy' if ok else 'NOT healthy'} {back_after:.0f} s after its start). {resumes} Log: {log.path}")
+        return 1 if ok else 2
+    started = time.monotonic()
+    start(cfg, log, to, cfg["break_env"])
+    ok, up_after, _ = wait_healthy(cfg, log, to, started)
+    if ok:
+        reveal(cfg, log, keeper, to, old_window)
+        took = time.monotonic() - began
+        gap = time.monotonic() - started + quit_took
+        resumes = cut_summary(cfg, log, cut, to)
+        wake(cfg, log, f"T3 switch done: T3 Code is running the {to} build ({BUILDS[to][0].parent.name}, sha256 {BUILDS[to][1][:12]}). "
+                       f"Switch took {took:.0f} s: old app quit in {quit_took:.0f} s, new app healthy {up_after:.0f} s after start "
+                       f"(no T3 window on screen for about {gap:.0f} s). No rollback. Waited {waited / 60:.0f} min for {cfg['quiet_s']} s "
+                       f"within max-busy {cfg['max_busy']}. {resumes} Log: {log.path}")
+        return 0
+    log("rollback", f"{to} was not healthy within {cfg['health_s']} s; back to {other} (the {to} app stays hidden)")
+    switch(cfg, log, other)
+    quit_ok, _, _ = quit_app(cfg, log, f"unhealthy {to} app", stall_escape=True)
+    if not quit_ok:
+        wake(cfg, log, f"T3 switch FAILED: the {to} build was not healthy and did not quit, so {other} could not be started. "
+                       f"Launchers are back on {other}; T3 needs a restart from the Touch Bar key. "
+                       f"{cut_summary(cfg, log, cut)} Log: {log.path}")
+        return 2
+    ok, back_after = back_to(cfg, log, keeper, other, old_window)
+    took = time.monotonic() - began
+    resumes = cut_summary(cfg, log, cut, other if ok else None, rolled_back=True)
+    wake(cfg, log, f"T3 switch rolled back: the {to} build was not healthy within {cfg['health_s']} s, so T3 Code is running the "
+                   f"{other} build again ({'healthy' if ok else 'NOT healthy'} {back_after:.0f} s after its start; whole switch "
+                   f"{took:.0f} s). {resumes} Log: {log.path}")
+    return 1 if ok else 2
+
+
+# ---------- commands ----------
+
+def cmd_run(args):
+    cfg = load_config(args.instance)
+    cfg["max_busy"] = args.max_busy
+    if args.instance is None:
+        cfg["arming_thread"] = os.environ.get("T3_SWITCH_ARMING_THREAD")
+    if args.wake:
+        cfg["wake"] = [*cfg["wake"][:-1], args.wake]
+    log_dir = Path(cfg["log_dir"])
+    log_dir.mkdir(parents=True, exist_ok=True)
+    lock = open(log_dir / "run.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(f"another t3-switch-when-idle run holds {log_dir / 'run.lock'}")
+    to = resolve_build(args.to, args.sha256)
+    other = resolve_build(args.rollback_to, args.rollback_sha256) if args.rollback_to else None
+    if other is None and to not in ROLLBACK:
+        sys.exit(f"--to {args.to} needs --rollback-to (arm passes the running build)")
+    log = Log(log_dir / f"{utc().replace(':', '')}-{to}.log")
+    code = run(cfg, to, log, other)
+    with open(log_dir / "history.log", "a") as history:
+        history.write(f"{utc()} {cfg['name']} to {to}: exit {code} ({log.path.name})\n")
+    log("end", f"exit {code} (0 switched, 1 rolled back healthy, 2 rolled back not healthy, 3 gave up, 4 not started, 5 old app never quit)")
+    return 0 if code in (0, 1, 3) else code
+
+
+def cmd_idle(args):
+    cfg = load_config(args.instance)
+    runs = active_runs(cfg)
+    print(f"{utc()} {cfg['name']}: {describe_runs(runs) if runs else 'idle: no run mid-turn'}")
+    for run_id, thread, status, requested, _ in runs:
+        print(f"  {status:9} since {requested}  {thread}")
+    return 1 if runs else 0
+
+
+def cmd_arm(args):
+    if subprocess.run(["systemctl", "--user", "is-active", "--quiet", UNIT]).returncode == 0:
+        sys.exit(f"{UNIT} is already armed: systemctl --user status {UNIT}")
+    subprocess.run(["systemctl", "--user", "reset-failed", UNIT], capture_output=True)
+    script = str(Path(__file__).resolve())
+    # A build named by path is pinned to its sha256 now and rolls back to what T3 runs now.
+    pins = []
+    to = resolve_build(args.to, args.sha256)
+    if to in BY_PATH:
+        pins += ["--sha256", BUILDS[to][1]]
+        back = args.rollback_to or running_appimage(LIVE)
+        if not back:
+            sys.exit("T3 is not running, so there is no build to roll back to; pass --rollback-to PATH")
+        other = resolve_build(back, args.rollback_sha256)
+        pins += ["--rollback-to", str(BUILDS[other][0]), "--rollback-sha256", BUILDS[other][1]]
+    description = (f"T3 switch to the {to} build: one wait for 90 s at max-busy {args.max_busy}, gives up after 6 h "
+                   f"(armed {utc()}, gives up {utc(6 * 3600)}); log ~/.local/state/t3-switch")
+    caller = os.environ.get("T3CODE_THREAD_ID")
+    hold = [f"--setenv=T3_SWITCH_ARMING_THREAD={caller}"] if caller else []
+    done = subprocess.run(["systemd-run", "--user", f"--unit={UNIT}", f"--description={description}",
+                           "--property=RuntimeMaxSec=6h30min", "--setenv=PYTHONUNBUFFERED=1",
+                           *hold, sys.executable, script, "run", "--to", str(BUILDS[to][0]) if to in BY_PATH else to, *pins,
+                           "--max-busy", str(args.max_busy),
+                           *(["--wake", args.wake] if args.wake else [])])
+    return done.returncode
+
+
+def proof_provider(root, t3home):
+    # A local Claude SDK protocol fixture. It holds the turn open without a model call or a login.
+    binary = root / "proof-claude"
+    binary.write_text("""#!/usr/bin/python3
+import json
+import sys
+import uuid
+
+args = sys.argv[1:]
+if "--version" in args:
+    print("2.1.141 (Claude Code)")
+    sys.exit()
+if args[:2] == ["auth", "status"]:
+    print('{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}')
+    sys.exit()
+session = next((args[args.index(flag) + 1] for flag in ("--session-id", "--resume") if flag in args),
+               str(uuid.uuid4()))
+for line in sys.stdin:
+    frame = json.loads(line)
+    if frame["type"] == "control_request":
+        print(json.dumps({"type": "control_response", "response": {
+            "subtype": "success", "request_id": frame["request_id"],
+            "response": {"commands": [], "models": [], "agents": [], "account": {},
+                         "hook_on_failure_supported": True, "hooks_applied": True,
+                         "errors": {}, "added": [], "removed": []}}}), flush=True)
+    elif frame["type"] == "user":
+        print(json.dumps({"type": "system", "subtype": "init", "session_id": session,
+                          "uuid": str(uuid.uuid4()), "tools": [], "mcp_servers": [],
+                          "model": "claude-sonnet-4-6", "claude_code_version": "2.1.141"}), flush=True)
+""")
+    binary.chmod(0o755)
+    (t3home / "userdata/settings.json").write_text(json.dumps({
+        "continueThreadsAfterServerUpdate": False,  # Keep the scenarios independent of built-in recovery.
+        "providerInstances": {
+            "claudeAgent": {"driver": "claudeAgent", "config": {"binaryPath": str(binary),
+                                                               "homePath": str(root / "proof-claude-home")}},
+            "codex": {"driver": "codex", "enabled": False},
+        },
+    }))
+
+
+def start_proof_turn(cfg, project, label, log):
+    title = f"Switch proof: {label}"
+    started = t3_cli(cfg, "thread", "start", "--base-dir", cfg["t3home"], "--provider", "claudeAgent",
+                     "--model", "claude-sonnet-4-6", "--title", title, "--json", str(project),
+                     "Hold this test turn open until the app restarts.")
+    if started.returncode != 0:
+        raise SystemExit(f"could not create the isolated proof turn: {started.stderr.strip()}")
+    thread = json.loads(started.stdout)["threadId"]
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if any(row[1] == thread and row[2] == "running" for row in active_runs(cfg)):
+            log("prove", f"isolated fixture turn running: {title!r} ({thread})")
+            return thread
+        time.sleep(1)
+    with closing(state_db(cfg)) as con:
+        rows = con.execute("select status from orchestration_v2_projection_runs where thread_id=?", (thread,))
+        log("prove", f"fixture did not reach running: {rows.fetchall()}")
+    raise SystemExit("isolated fixture turn did not reach running")
+
+
+def prove_receipt(cfg, thread, build, log):
+    prefix = f"[from Agent Zero] T3 {build} at "
+    with closing(state_db(cfg)) as con:
+        rows = con.execute("select payload_json, created_at from orchestration_v2_projection_messages"
+                           " where thread_id = ? and role = 'user'", (thread,))
+        matches = [created for payload, created in rows if json.loads(payload).get("text", "").startswith(prefix)]
+    log("prove", f"{thread}: {len(matches)} resume message(s) persisted on the test thread"
+                 f"{' at ' + ', '.join(matches) if matches else ''}")
+    return len(matches) == 1
+
+
+def cmd_prove(args):
+    """Prove busy switch, failed start and slow quit on a second T3; check that live T3 stays unchanged."""
+    root = HOME / "SISO_Workspace/_data/scratch/2026-11-19-t3-switch" / f"prove-{utc().replace(':', '')}"
+    home, t3home, stub = root / "home", root / "t3home", root / "stub"
+    port = next(p for p in range(3890, 3990) if server_pid(p) is None and port_free(p))
+    for rel in (".local/share/applications/t3code.desktop", ".local/share/applications/com.t3tools.T3Code.desktop",
+                ".config/hypr/bindings.lua"):
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(HOME / rel, home / rel)
+    (t3home / "userdata").mkdir(parents=True)
+    (t3home / "userdata/cli-command-first-launch").write_text("")  # no t3 command install from a fresh app
+    proof_provider(root, t3home)
+    project = root / "project"
+    project.mkdir()
+    stub.mkdir()
+    (stub / "hyprctl").write_text(f"#!/bin/sh\necho \"stub hyprctl $*: live Hyprland not reloaded\" >> {root}/stub.log\n")
+    (root / "wake").write_text(f"#!/bin/sh\nprintf '%s WAKE %s\\n' \"$(date -u +%FT%TZ)\" \"$*\" >> {root}/wake.log\n")
+    for f in (stub / "hyprctl", root / "wake"):
+        f.chmod(0o755)
+    xdg = {"XDG_CONFIG_HOME": home / ".config", "XDG_DATA_HOME": home / ".local/share",
+           "XDG_CACHE_HOME": home / ".cache", "XDG_STATE_HOME": home / ".local/state"}
+    base = {
+        "name": "prove", "home": str(home), "t3home": str(t3home), "port": port,
+        "userdata": str(home / ".config/t3code-v2"),
+        "app_env": {"HOME": str(home), **{k: str(v) for k, v in xdg.items()}, "PATH": "/usr/bin:/bin",
+                    "T3CODE_HOME": str(t3home),
+                    "T3CODE_PORT": str(port), "T3CODE_DISABLE_AUTO_UPDATE": "1", "T3CODE_TELEMETRY_ENABLED": "false"},
+        "hidden_ws": "special:t3switch-test", "show_ws": "special:t3switch-test-final",
+        "switch_env": {"HOME": str(home), "PATH": f"{stub}:{os.environ.get('PATH', '/usr/bin:/bin')}"},
+        "wake": [str(root / "wake"), "thread", "send", AGENT_ZERO],
+        "log_dir": str(root / "log"), "give_up_s": 1800,
+    }
+    (root / "clean.json").write_text(json.dumps(base, indent=2))
+    # A start that fails with no window at all (Electron's RunAsNode fuse is on): nothing can reach the screen.
+    (root / "broken.json").write_text(json.dumps({**base, "break_env": {"ELECTRON_RUN_AS_NODE": "1"}}, indent=2))
+    (root / "slowquit.json").write_text(json.dumps({**base, "quit_s": 0}, indent=2))
+    cfg = load_config(root / "clean.json")
+    log = Log(root / "PROOF.log")
+    before = live_snapshot()
+    log("prove", f"second T3 in {root}, port {port}; live before: {before['summary']}")
+    log("prove", f"test windows: started hidden on {base['hidden_ws']}, final window shown on {base['show_ws']}; "
+                 f"never on a normal workspace, never focused (judge: Hyprland's event socket for the whole proof)")
+    judge = Keeper(cfg, log, act=True)
+
+    def proof_windows():
+        clients = json.loads(hyprctl("clients", "-j").stdout or "[]")
+        return [(c["address"], c["workspace"]["name"]) for c in clients if belongs(cfg, c.get("pid"))]
+
+    def reset_to_stock(label):
+        log("prove", f"{label}: test instance on the stock build")
+        quit_app(cfg, log, "test instance", stall_escape=True)
+        switch(cfg, log, "stock")
+        began = time.monotonic()
+        start(cfg, log, "stock")
+        if not wait_healthy(cfg, log, "stock", began)[0]:
+            raise SystemExit("test instance did not come up on stock; proof stopped")
+
+    results = {}
+    receipts = []
+    scenarios = (("clean switch", "clean"), ("forced failure (noqueue start makes no window)", "broken"),
+                 ("slow quit (quit limit 0 s)", "slowquit"))
+    windows_seen = []
+    try:
+        for label, slug in scenarios:
+            config = root / f"{slug}.json"
+            judge.act = True
+            reset_to_stock(label)
+            if slug == "clean":
+                added = t3_cli(cfg, "project", "add", "--base-dir", cfg["t3home"], str(project))
+                if added.returncode != 0:
+                    raise SystemExit(f"could not create the isolated proof project: {added.stderr.strip()}")
+            thread = start_proof_turn(cfg, project, label, log) if slug != "slowquit" else None
+            max_busy = "1" if thread else "0"
+            unit = f"t3-switch-prove-{slug}-{os.getpid()}"
+            log("prove", f"{label}: {unit} run --instance {config.name} --max-busy {max_busy}")
+            judge.act = False  # the run's own keeper acts now; the judge only records
+            done = subprocess.run(["systemd-run", "--user", f"--unit={unit}", "--wait", "--quiet", "--collect",
+                                   "--setenv=PYTHONUNBUFFERED=1", sys.executable, str(Path(__file__).resolve()),
+                                   "run", "--to", "noqueue", "--instance", str(config), "--max-busy", max_busy],
+                                  capture_output=True, text=True)
+            judge.act = True
+            history = (root / "log/history.log").read_text().splitlines()
+            results[label] = int(history[-1].split("exit ")[1].split()[0])
+            seen = proof_windows()
+            windows_seen += seen
+            build = "noqueue" if slug == "clean" else "stock"
+            log("prove", f"{label}: unit exit {done.returncode}, run exit {results[label]}; test windows {seen}; "
+                         f"now {health(cfg, build)[1]}")
+            if thread:
+                receipts.append(prove_receipt(cfg, thread,
+                                              "restarted onto the noqueue build" if slug == "clean" else "is back on stock",
+                                              log))
+    finally:
+        quit_app(cfg, log, "test instance (end of proof)", stall_escape=True)
+        judge.stop()
+    left = proof_windows()
+    shown_right = bool(windows_seen) and all(ws == base["show_ws"] for _, ws in windows_seen)
+    log("prove", f"judge: {len(judge.incidents)} incident(s) {judge.incidents}; final windows all on {base['show_ws']}: "
+                 f"{shown_right}; proof windows left: {left}")
+    after = live_snapshot()
+    same = before["fingerprint"] == after["fingerprint"]
+    log("prove", f"live after: {after['summary']}; {'UNCHANGED' if same else 'CHANGED: ' + json.dumps(after)}")
+    wakes = (root / "wake.log").read_text() if (root / "wake.log").exists() else "(none)"
+    log("prove", f"wakes recorded (not sent):\n{wakes}")
+    # Clean: 0 (switched, no rollback). Forced failure and slow quit: 1 (rolled back, stock healthy again).
+    ok = (same and list(results.values()) == [0, 1, 1] and receipts == [True, True]
+          and wakes.count("resume accepted") == 2 and not judge.incidents and shown_right and not left
+          and "No rollback" in wakes
+          and "build was not healthy within" in wakes and "took" in wakes and "to quit (limit 0 s)" in wakes)
+    log("prove", f"{'PASS' if ok else 'FAIL'}: {results}")
+    return 0 if ok else 1
+
+
+def port_free(port):
+    with socket.socket() as s:
+        return s.connect_ex(("127.0.0.1", port)) != 0
+
+
+def live_snapshot():
+    mains, server, _ = find_mains(LIVE)
+    main = next(iter(mains)) if len(mains) == 1 else None
+    files = [HOME / ".local/share/applications/t3code.desktop", HOME / ".local/share/applications/com.t3tools.T3Code.desktop",
+             HOME / ".config/hypr/bindings.lua", HOME / ".config/mimeapps.list", HOME / ".t3/bin/t3",
+             HOME / ".local/bin/t3", HOME / ".bashrc", HOME / ".zshrc", HOME / ".profile"]
+    digests = {str(f): (sha256(f) if f.is_file() else None) for f in files}
+    window = window_of(main) if main else None
+    slice_limits = subprocess.run(["systemctl", "--user", "show", "-p", "MemoryHigh,MemoryMax", "app-t3code-agents.slice"],
+                                  capture_output=True, text=True).stdout.split()
+    fingerprint = {"main": main, "server": server, "window": window and window["address"], "files": digests,
+                   "agents_slice": slice_limits}
+    summary = f"main {main}, server {server} on {LIVE['port']}, window {window and window['address']}, " \
+              f"{sum(1 for d in digests.values() if d)} launcher/shell files hashed, agents slice {' '.join(slice_limits)}"
+    return {"fingerprint": fingerprint, "summary": summary}
+
+
+def nonnegative_int(value):
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return number
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("run", "arm"):
+        p = sub.add_parser(name)
+        p.add_argument("--to", default="noqueue", help=f"{', '.join(sorted(BUILDS))}, or an absolute .AppImage path")
+        p.add_argument("--sha256", help="pin for --to PATH (default: its sha256 now)")
+        p.add_argument("--rollback-to", help="build or .AppImage path to go back to (PATH default: the running build)")
+        p.add_argument("--rollback-sha256", help="pin for --rollback-to PATH")
+        p.add_argument("--max-busy", type=nonnegative_int, default=0, help="maximum busy runs during the quiet interval")
+        p.add_argument("--wake", help="thread to send the result to (default Agent Zero)")
+        if name == "run":
+            p.add_argument("--instance")
+    sub.add_parser("idle").add_argument("--instance")
+    sub.add_parser("prove")
+    args = parser.parse_args()
+    return {"run": cmd_run, "idle": cmd_idle, "arm": cmd_arm, "prove": cmd_prove}[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
