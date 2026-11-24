@@ -249,6 +249,13 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
         return Atom.make((get) => get(state).removedAt);
       },
     }),
+    /** What each thread a fleet row shows last said, read again while the rows stay open. */
+    threadLines: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:orchestration:thread-lines",
+      tag: ORCHESTRATION_V2_WS_METHODS.getThreadLines,
+      staleTimeMs: 10_000,
+      refreshIntervalMs: 15_000,
+    }),
     threadFamily: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:orchestration:thread-family-for-delete",
       tag: ORCHESTRATION_V2_WS_METHODS.getThreadFamily,

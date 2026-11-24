@@ -21,6 +21,7 @@ import {
   OrchestrationV2ForceStopThreadError,
   type OrchestrationV2ForceStopThreadInput,
   type OrchestrationV2ForceStopThreadResult,
+  type OrchestrationV2ThreadLine,
   type ModelSelection,
   type OrchestrationV2Actor,
   type OrchestrationV2Command,
@@ -78,6 +79,10 @@ import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { ThreadWorktreeRestore } from "../workspace/restoreMissingWorktree.ts";
 import { checkOutput, outputRequestProblem } from "./runOutput.ts";
+import { threadLineOf } from "./threadLine.ts";
+
+/** A fleet panel asks for the rows it shows; more than this is cut, not read. */
+const THREAD_LINES_READ_LIMIT = 60;
 
 export type ThreadManagementSendMode = "auto" | "queue" | "steer" | "restart";
 
@@ -486,6 +491,10 @@ export interface ThreadManagementServiceShape {
   readonly listAppOwnedChildThreadIds: Orchestrator.OrchestratorV2["Service"]["listAppOwnedChildThreadIds"];
   readonly getThreadLinkMetadata: Orchestrator.OrchestratorV2["Service"]["getThreadLinkMetadata"];
   readonly getThreadTitles: Orchestrator.OrchestratorV2["Service"]["getThreadTitles"];
+  /** Each thread's newest message, cut to a line; threads without one are absent. */
+  readonly getThreadLines: (
+    threadIds: ReadonlyArray<ThreadId>,
+  ) => Effect.Effect<Record<ThreadId, OrchestrationV2ThreadLine>>;
   /** Omit `projectId` to list every project's threads. Side chats are never listed. */
   readonly listProjectThreads: (input: {
     readonly projectId?: ProjectId | undefined;
@@ -2027,6 +2036,39 @@ const make = Effect.gen(function* () {
       },
     ),
     getThreadTitles: orchestrator.getThreadTitles,
+    getThreadLines: Effect.fn("ThreadManagementService.getThreadLines")(function* (threadIds) {
+      const lines = yield* Effect.forEach(
+        threadIds.slice(0, THREAD_LINES_READ_LIMIT),
+        (threadId) =>
+          // Not getTimelinePage above: looking at a row should not import a thread's old transcript.
+          orchestrator
+            .getTimelinePage(threadId, {
+              beforePosition: Number.POSITIVE_INFINITY,
+              limit: 1,
+              view: "messages",
+            })
+            .pipe(
+              Effect.map((page) => {
+                const item = page.items.at(-1)?.item;
+                const line =
+                  item === undefined
+                    ? null
+                    : threadLineOf(
+                        item.type,
+                        item.type === "proposed_plan"
+                          ? item.markdown
+                          : item.type === "user_message" || item.type === "assistant_message"
+                            ? item.text
+                            : null,
+                      );
+                return line === null ? [] : [[threadId, line] as const];
+              }),
+              Effect.orElseSucceed(() => []),
+            ),
+        { concurrency: 4 },
+      );
+      return Object.fromEntries(lines.flat()) as Record<ThreadId, OrchestrationV2ThreadLine>;
+    }),
     getThreadLinkMetadata: orchestrator.getThreadLinkMetadata,
     listProjectThreads,
     sendToThread,

@@ -3,8 +3,16 @@ import {
   OrchestratorMcpFailure,
   type PeerLink,
   PeerLinkThreadReadError,
+  ProviderDriverKind,
+  ProviderThreadId,
+  ProviderTurnId,
+  ThreadId,
 } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
+import {
+  makeProviderFailure,
+  makeProviderFailureTurnItem,
+} from "@t3tools/provider-core/server/failure";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -42,6 +50,22 @@ const thread = (id: string, fields: Record<string, unknown> = {}) => ({
   updatedAt: "2026-11-24T09:00:00.000Z",
   ...fields,
 });
+
+/** A run's terminal failure as the linked machine's own timeline lists it. */
+const failureItem = (failureClass: "usage_limit" | "provider_error", message: string) => {
+  const item = makeProviderFailureTurnItem({
+    driver: ProviderDriverKind.make("claudeAgent"),
+    threadId: ThreadId.make("stopped"),
+    runId: null,
+    nodeId: null,
+    providerThreadId: ProviderThreadId.make("provider-thread"),
+    providerTurnId: ProviderTurnId.make("provider-turn"),
+    itemOrdinal: 3,
+    failure: makeProviderFailure({ class: failureClass, message }),
+    occurredAt: DateTime.makeUnsafe("2026-11-24T17:30:07.000Z"),
+  });
+  return { type: item.type, title: item.title, text: item.failure.message };
+};
 
 interface Call {
   readonly tool: string;
@@ -138,8 +162,7 @@ it.effect(
       ]);
       const byId = new Map(result.threads.map((item) => [String(item.threadId), item]));
       expect(byId.get("asks")?.pendingRequestCount).toBe(1);
-      // A thread that waits on another thread is not read again: it waits on no person.
-      expect(byId.get("watches")?.pendingRequestCount).toBeNull();
+      expect(byId.get("watches")?.pendingRequestCount).toBe(0);
       expect(byId.get("helper")).toMatchObject({
         parentThreadId: "watches",
         relationshipToParent: "subagent",
@@ -150,7 +173,7 @@ it.effect(
         calls
           .filter((call) => call.tool === "t3_thread_read")
           .map((call) => call.arguments.threadId),
-      ).toEqual(["asks", "helper"]);
+      ).toEqual(["asks", "watches", "helper", "quiet"]);
       // Every call lists across projects with sub-agents, at the narrowest modes.
       for (const call of calls.filter((item) => item.tool === "t3_thread_list")) {
         expect(call.arguments).toMatchObject({ allProjects: true, includeSubagents: true });
@@ -158,6 +181,82 @@ it.effect(
       expect(new Set(calls.map((call) => call.limits.runtimeMode))).toEqual(
         new Set(["approval-required"]),
       );
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect(
+  "carries what each thread last said and why a run stopped, read again once it changes",
+  () => {
+    let doneUpdatedAt = "2026-11-24T09:00:00.000Z";
+    const { calls, layer } = fixture({
+      answer: (call) => {
+        if (call.tool === "t3_thread_list") {
+          return Effect.succeed({
+            threads: [
+              thread("busy", { status: "running", updatedAt: "2026-11-24T09:05:00.000Z" }),
+              thread("done", { updatedAt: doneUpdatedAt }),
+              thread("limited", { status: "failed", settled: true }),
+              thread("broke", { status: "failed" }),
+            ],
+          });
+        }
+        const items: Record<string, ReadonlyArray<unknown>> = {
+          busy: [
+            { type: "assistant_message", text: "Checking   the\nchangelog " + "x".repeat(400) },
+          ],
+          done: [{ type: "user_message", text: "Tidy the docs" }],
+          limited: [
+            { type: "system_notice", text: "This turn is paused until the limit resets." },
+            { type: "assistant_message", text: "You've hit your weekly limit · resets Nov 27" },
+            failureItem("usage_limit", "Rate limit reached."),
+          ],
+          broke: [
+            { type: "assistant_message", text: "Running the migration" },
+            failureItem("provider_error", "The provider closed the connection."),
+          ],
+        };
+        return Effect.succeed({
+          thread: { pendingRequestCount: 0 },
+          items: items[String(call.arguments.threadId)] ?? [],
+        });
+      },
+    });
+    const reads = () =>
+      calls.splice(0).flatMap((call) => (call.tool === "t3_thread_read" ? [call.arguments] : []));
+    return Effect.gen(function* () {
+      const result = yield* list;
+      const byId = new Map(result.threads.map((item) => [String(item.threadId), item]));
+      expect(byId.get("busy")?.latestMessage?.author).toBe("agent");
+      expect(byId.get("busy")?.latestMessage?.text).toMatch(/^Checking the changelog x+$/);
+      expect(byId.get("busy")?.latestMessage?.text).toHaveLength(160);
+      expect(byId.get("done")?.latestMessage).toEqual({ author: "user", text: "Tidy the docs" });
+      expect(byId.get("done")?.stop).toBeUndefined();
+      expect(byId.get("limited")).toMatchObject({
+        latestMessage: { author: "agent", text: "You've hit your weekly limit · resets Nov 27" },
+        stop: { usageLimit: true },
+      });
+      expect(byId.get("broke")).toMatchObject({
+        latestMessage: { author: "agent", text: "Running the migration" },
+        stop: { usageLimit: false, message: "The provider closed the connection." },
+      });
+      // A failure is an activity item, so a failed thread's page includes activity.
+      const first = reads();
+      expect(first.map((read) => [read.threadId, read.view ?? "messages"])).toEqual([
+        ["busy", "messages"],
+        ["done", "messages"],
+        ["limited", "activity"],
+        ["broke", "activity"],
+      ]);
+
+      // Only the live thread is read again until another one changes.
+      expect((yield* list).threads.find((item) => item.threadId === "limited")?.stop).toEqual(
+        byId.get("limited")?.stop,
+      );
+      expect(reads().map((read) => read.threadId)).toEqual(["busy"]);
+      doneUpdatedAt = "2026-11-24T10:00:00.000Z";
+      yield* list;
+      expect(reads().map((read) => read.threadId)).toEqual(["busy", "done"]);
     }).pipe(Effect.provide(layer));
   },
 );
