@@ -1,7 +1,7 @@
 import * as Schema from "effect/Schema";
 
 import { EnvironmentId, IsoDateTime, NonNegativeInt, ThreadId } from "./baseSchemas.ts";
-import { OrchestrationV2DelegatedFrom } from "./orchestrationV2.ts";
+import { OrchestrationV2DelegatedFrom, OrchestrationV2ThreadLine } from "./orchestrationV2.ts";
 import { OrchestratorMcpThreadStatus } from "./orchestratorMcp.ts";
 
 /**
@@ -14,6 +14,15 @@ export const PeerLinkThreadsInput = Schema.Struct({
   environmentId: EnvironmentId,
 });
 export type PeerLinkThreadsInput = typeof PeerLinkThreadsInput.Type;
+
+/** Why a thread's latest run stopped, as its machine recorded it. */
+export const PeerLinkThreadStop = Schema.Struct({
+  /** A plan's usage limit stopped it, so it waits for the limit to reset. */
+  usageLimit: Schema.Boolean,
+  /** The provider's own words, cut to about a line. */
+  message: Schema.String,
+});
+export type PeerLinkThreadStop = typeof PeerLinkThreadStop.Type;
 
 /** One thread on a linked environment. What an older machine does not report is null. */
 export const PeerLinkThreadSummary = Schema.Struct({
@@ -34,11 +43,12 @@ export const PeerLinkThreadSummary = Schema.Struct({
   blockedOnThreadWait: Schema.Boolean,
   /** Sub-agents, commands and monitors the thread still waits on. */
   backgroundTaskCount: NonNegativeInt,
-  /**
-   * Approvals and questions waiting for an answer. Read only for a thread whose run waits, so
-   * null for the rest, and for a machine too old to say.
-   */
+  /** Approvals and questions waiting for an answer; null when the thread was not read. */
   pendingRequestCount: Schema.NullOr(NonNegativeInt),
+  /** Absent when the thread was not read, and from servers that predate it. */
+  latestMessage: Schema.optional(OrchestrationV2ThreadLine),
+  /** For a thread whose run failed: why, when its timeline says. */
+  stop: Schema.optional(PeerLinkThreadStop),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });

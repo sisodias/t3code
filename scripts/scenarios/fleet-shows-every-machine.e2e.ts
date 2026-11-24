@@ -228,6 +228,10 @@ test(
       await expect(panel.getByText("Nightly build", { exact: true })).toBeVisible(LINKED_READ);
       await expect(needsYou.getByText("Needs approval", { exact: true })).toBeVisible();
       await expect(needsYou.getByText("under Release coordinator", { exact: true })).toBeVisible();
+      // Each row says what its agent was last asked or said; this machine's lines are read for the rows on show.
+      await expect(
+        needsYou.getByText("Asked: Check the changelog lists every fix", { exact: true }),
+      ).toBeVisible({ timeout: 30_000 });
       await panelSettled();
       await app.screenshot("fleet-permission-waiting");
 
@@ -254,6 +258,16 @@ test(
       await expect(panel.getByText("2 machines · 0 working", { exact: true })).toBeVisible({
         timeout: 30_000,
       });
+      await expect(
+        panel
+          .getByRole("button", "Docs cleanup", { exact: false })
+          .getByText("first fixture turn complete", { exact: true }),
+      ).toBeVisible({ timeout: 30_000 });
+      await expect(
+        panel
+          .getByRole("region", "Build box")
+          .getByText("first fixture turn complete", { exact: true }),
+      ).toBeVisible(LINKED_READ);
       await panelSettled();
       await app.screenshot("fleet-all-quiet");
       await fleet.tap();
@@ -267,6 +281,9 @@ test(
       await expect(screen.getByRole("button", "Fleet: 1 needs you")).toBeVisible(LINKED_READ);
       await fleet.tap();
       await expect(needsYou.getByText("Waiting for your answer", { exact: true })).toBeVisible();
+      await expect(
+        needsYou.getByText("Asked: Run the schema migration", { exact: true }),
+      ).toBeVisible();
       await panelSettled();
       await app.screenshot("fleet-linked-waiting");
       await needsYou.getByRole("button", "Schema migration", { exact: false }).tap();

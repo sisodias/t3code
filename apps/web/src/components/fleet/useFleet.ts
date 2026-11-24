@@ -9,13 +9,37 @@ import { environmentAtomList, environmentIdsKey } from "../../state/environmentA
 import { useEnvironments } from "../../state/environments";
 import { peerLinkEnvironment } from "../../state/peerLinks";
 import { formatEnvironmentQueryError } from "../../state/query";
+import { orchestrationEnvironment } from "../../state/orchestration";
 import { useEnvironmentsWithScope } from "../../state/session";
 import {
+  type FleetLine,
+  fleetLine,
   type FleetMachine,
+  type FleetReach,
+  type FleetThread,
   fleetThreadFromLinked,
   fleetThreadFromShell,
   isFleetShell,
 } from "./fleet.logic";
+
+const noLineRead = Atom.make(null).pipe(Atom.withLabel("fleet:no-line-read"));
+
+/**
+ * A row's line. A connected machine's thread list carries no message text, so a row on show
+ * reads its thread's newest message, again while it stays on show; a linked list carries it.
+ */
+export function useFleetLine(thread: FleetThread, reach: FleetReach | undefined): FleetLine | null {
+  const reads = thread.line === null && reach?.kind === "connected";
+  const result = useAtomValue(
+    reads
+      ? orchestrationEnvironment.threadLines({
+          environmentId: thread.environmentId,
+          input: { threadIds: [thread.threadId] },
+        })
+      : noLineRead,
+  );
+  return fleetLine(thread, result?._tag === "Success" ? result.value[thread.threadId] : undefined);
+}
 
 const linkNamesAtom = environmentAtomList("fleet:link-names", (environmentId) =>
   peerLinkEnvironment.names({ environmentId, input: {} }),

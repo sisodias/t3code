@@ -4100,6 +4100,7 @@ export const ORCHESTRATION_V2_WS_METHODS = {
   getThreadFamily: "orchestration.getThreadFamily",
   getThreadTitles: "orchestration.getThreadTitles",
   getThreadLinkMetadata: "orchestration.getThreadLinkMetadata",
+  getThreadLines: "orchestration.getThreadLines",
   getWorktreeThreadIds: "orchestration.getWorktreeThreadIds",
   getOlderSettledThreads: "orchestration.getOlderSettledThreads",
   getThreadProjection: "orchestration.getThreadProjection",
@@ -4257,6 +4258,14 @@ export const OrchestrationV2ThreadLinkMetadata = Schema.Struct({
   projectId: Schema.NullOr(ProjectId),
 });
 export type OrchestrationV2ThreadLinkMetadata = typeof OrchestrationV2ThreadLinkMetadata.Type;
+
+/** A thread's newest message, cut to about a line. */
+export const OrchestrationV2ThreadLine = Schema.Struct({
+  /** A person or another agent asked it, or the thread's own agent said it. */
+  author: Schema.Literals(["user", "agent"]),
+  text: Schema.String,
+});
+export type OrchestrationV2ThreadLine = typeof OrchestrationV2ThreadLine.Type;
 
 export const OrchestrationV2GetWorktreeThreadIdsInput = Schema.Struct({
   worktreePath: TrimmedNonEmptyString,
@@ -4790,6 +4799,11 @@ export const OrchestrationV2RpcSchemas = {
   getThreadLinkMetadata: {
     input: OrchestrationV2GetThreadTitlesInput,
     output: Schema.Record(ThreadId, OrchestrationV2ThreadLinkMetadata),
+  },
+  /** Lines of the requested threads that have a message; others are absent. */
+  getThreadLines: {
+    input: OrchestrationV2GetThreadTitlesInput,
+    output: Schema.Record(ThreadId, OrchestrationV2ThreadLine),
   },
   getWorktreeThreadIds: {
     input: OrchestrationV2GetWorktreeThreadIdsInput,
