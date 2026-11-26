@@ -272,6 +272,12 @@ function limitAccountKeyResolver(presentations: LimitPresentations) {
   );
 }
 
+/** Billing notes must use the same account/workspace identity as native Usage rows. */
+export function nativeUsageAccountIdentity(presentations: LimitPresentations) {
+  const resolve = limitAccountKeyResolver(presentations);
+  return (provider: ServerProvider) => resolve(nativeReport(provider));
+}
+
 const nativeRowKey = (
   resolveKey: ReturnType<typeof accountKeyResolver>,
   environmentId: EnvironmentId,

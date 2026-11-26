@@ -65,6 +65,8 @@ export const ServerProviderAuth = Schema.Struct({
   type: Schema.optional(TrimmedNonEmptyString),
   label: Schema.optional(TrimmedNonEmptyString),
   email: Schema.optional(TrimmedNonEmptyString),
+  /** Last subscription access end reported by the provider. */
+  paidThrough: Schema.optional(IsoDateTime),
   action: Schema.optional(AcpRegistryUrlAuthAction),
   canLogout: Schema.optional(Schema.Boolean),
   subscriptionSharing: Schema.optional(Schema.Boolean),
