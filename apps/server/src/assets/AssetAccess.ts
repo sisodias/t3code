@@ -1075,7 +1075,15 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
       ),
       Effect.orElseSucceed(() => null),
     );
-    return file ? ({ kind: "file", path: background.path, file } satisfies ResolvedAsset) : null;
+    // A media type serves the video with ranges and without validators, so seeks get 206s.
+    return file
+      ? ({
+          kind: "file",
+          path: background.path,
+          file,
+          mimeType: background.mimeType,
+        } satisfies ResolvedAsset)
+      : null;
   }
 
   if (claims.kind === "native-app-icon") {

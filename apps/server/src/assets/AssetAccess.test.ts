@@ -241,6 +241,77 @@ describe("AssetAccess", () => {
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
+  it.effect("serves a theme's background video in ranges, without validators", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const { environmentThemesDir } = yield* ServerConfig.ServerConfig;
+      yield* fs.makeDirectory(environmentThemesDir, { recursive: true });
+      // An EBML header with the webm DocType, padded to 1000 bytes.
+      const video = new Uint8Array(1000);
+      video.set(Buffer.from("1a45dfa39f4286810142f7810142f2810442f381084282847765626d", "hex"));
+      yield* fs.writeFile(`${environmentThemesDir}/frieren.webm`, video);
+      const result = yield* issueAssetUrl({
+        resource: { _tag: "environment-theme-background", themeId: "frieren" },
+      });
+      const suffix = result.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const separator = suffix.indexOf("/");
+      // Each response consumes the file the asset opened, as each request resolves its own.
+      const request = (range?: string) =>
+        Effect.gen(function* () {
+          const asset = yield* resolveAsset(
+            suffix.slice(0, separator),
+            suffix.slice(separator + 1),
+          );
+          if (asset?.kind !== "file") return yield* Effect.die("the video did not resolve");
+          return HttpServerResponse.toWeb(yield* assetFileResponse(asset, range));
+        });
+
+      const start = yield* request("bytes=0-99");
+      expect(start.status).toBe(206);
+      expect(start.headers.get("content-type")).toBe("video/webm");
+      expect(start.headers.get("content-range")).toBe("bytes 0-99/1000");
+      expect(start.headers.get("content-length")).toBe("100");
+      expect(start.headers.get("accept-ranges")).toBe("bytes");
+      // A validator would let the browser send If-Range, which gets the whole file back.
+      expect(start.headers.get("etag")).toBeNull();
+      expect(start.headers.get("cache-control")).toBe("private, no-store");
+      expect(new Uint8Array(yield* Effect.promise(() => start.arrayBuffer()))).toEqual(
+        video.subarray(0, 100),
+      );
+
+      const end = yield* request("bytes=900-");
+      expect(end.status).toBe(206);
+      expect(end.headers.get("content-range")).toBe("bytes 900-999/1000");
+      expect((yield* Effect.promise(() => end.arrayBuffer())).byteLength).toBe(100);
+
+      const past = yield* request("bytes=2000-");
+      expect(past.status).toBe(416);
+      expect(past.headers.get("content-range")).toBe("bytes */1000");
+
+      const whole = yield* request();
+      expect(whole.status).toBe(200);
+      expect(whole.headers.get("content-length")).toBe("1000");
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("serves no background whose bytes are not the kind its name says", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const { environmentThemesDir } = yield* ServerConfig.ServerConfig;
+      yield* fs.makeDirectory(environmentThemesDir, { recursive: true });
+      yield* fs.writeFile(`${environmentThemesDir}/disguised.webm`, screenshotPng);
+      yield* fs.writeFileString(`${environmentThemesDir}/disguised.png`, "<svg onload=alert(1)>");
+      const result = yield* issueAssetUrl({
+        resource: { _tag: "environment-theme-background", themeId: "disguised" },
+      });
+      const suffix = result.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const separator = suffix.indexOf("/");
+      expect(
+        yield* resolveAsset(suffix.slice(0, separator), suffix.slice(separator + 1)),
+      ).toBeNull();
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect("issues exact URLs for media and browser documents outside the workspace", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

@@ -33,6 +33,7 @@ const AGENT_THEME = {
 
 it.effect("applies the theme through the service and reports a refusal as an invalid request", () =>
   Effect.gen(function* () {
+    const applied: Array<Parameters<EnvironmentThemeService["Service"]["apply"]>[0]> = [];
     const layerDependencies = Layer.mergeAll(
       ThreadCommandExecutor.layer,
       Layer.succeed(McpInvocationContext.McpInvocationContext, {
@@ -59,7 +60,9 @@ it.effect("applies the theme through the service and reports a refusal as an inv
                   problem: "is not a built-in or published theme.",
                 }),
               )
-            : Effect.void,
+            : Effect.sync(() => {
+                applied.push(input);
+              }),
       }),
     );
     yield* Effect.gen(function* () {
@@ -80,7 +83,18 @@ it.effect("applies the theme through the service and reports a refusal as an inv
         appearance: "dark",
         published: false,
       });
+      expect(yield* call({ themeId: "agent-look", background: "/videos/loop.webm" })).toEqual({
+        themeId: "agent-look",
+        published: false,
+      });
+      expect(applied.at(-1)).toMatchObject({
+        themeId: "agent-look",
+        background: "/videos/loop.webm",
+      });
       expect(yield* call({ theme: AGENT_THEME })).toMatchObject({ code: "invalid_request" });
+      expect(yield* call({ background: "/videos/loop.webm", appearance: "dark" })).toMatchObject({
+        code: "invalid_request",
+      });
       expect(yield* call({})).toMatchObject({ code: "invalid_request" });
       expect(yield* call({ themeId: "missing" })).toMatchObject({
         code: "invalid_request",
