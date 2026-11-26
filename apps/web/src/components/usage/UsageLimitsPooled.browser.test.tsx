@@ -102,3 +102,66 @@ describe("UsageLimitsPooled next refill", () => {
     await expect.element(screen.getByText(/^↻ \+\d+%$/)).not.toBeInTheDocument();
   });
 });
+
+describe("Usage subscription billing dates", () => {
+  it("shows a reported end separately from quota and keeps recorded dates tied to an account", async () => {
+    const paid = {
+      ...managedChatGpt("paid", "Personal"),
+      auth: {
+        status: "authenticated" as const,
+        type: "chatgpt",
+        email: "personal@example.org",
+        paidThrough: "2026-11-10T12:00:00Z",
+      },
+    };
+    const claude = {
+      ...managedChatGpt("claude", "Work"),
+      driver: ProviderDriverKind.make("claudeAgent"),
+      auth: {
+        status: "authenticated" as const,
+        type: "max20",
+        label: "Claude Ultra Subscription",
+        email: "work@example.org",
+        workspaceId: "org-a",
+      },
+      usageLimits: { checkedAt, windows: [] },
+    };
+    const view = (providers: ServerProvider[]) => (
+      <UsageLimitsPooled
+        now={Date.parse(checkedAt)}
+        presentations={
+          new Map([
+            [
+              EnvironmentId.make("desk"),
+              { entry: { target: { label: "Desk" } }, serverConfig: { providers } },
+            ],
+          ])
+        }
+      />
+    );
+    await using screen = await render(
+      view([paid, { ...paid, instanceId: ProviderInstanceId.make("alias") }, claude]),
+    );
+    await expect.element(screen.getByText(/Last reported paid through/)).toBeVisible();
+    expect(document.querySelectorAll("time[datetime='2026-11-10T12:00:00Z']")).toHaveLength(1);
+    const date = screen.getByLabelText("Billing date for Work");
+    await date.fill("2026-11-17");
+    const { workspaceId: _workspace, ...partialAuth } = claude.auth;
+    await screen.rerender(
+      view([
+        claude,
+        { ...claude, auth: partialAuth, instanceId: ProviderInstanceId.make("partial") },
+      ]),
+    );
+    expect(document.querySelectorAll('input[type="date"]')).toHaveLength(1);
+    await expect.element(date).toHaveValue("2026-11-17");
+    await screen.rerender(
+      view([{ ...claude, auth: { ...claude.auth, email: "other@example.org" } }]),
+    );
+    await expect.element(date).toHaveValue("");
+    await screen.rerender(view([claude]));
+    await expect.element(date).toHaveValue("2026-11-17");
+    await date.fill("");
+    await expect.element(date).toHaveValue("");
+  });
+});

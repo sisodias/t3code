@@ -26,6 +26,7 @@ import {
   useState,
 } from "react";
 
+import { UsageBillingDates } from "./UsageBillingDates";
 import { ensureLocalApi } from "../../localApi";
 import { usePrimarySettings } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
@@ -745,6 +746,7 @@ export function UsageLimitsPooled({
           </Button>
         </section>
       ))}
+      <UsageBillingDates presentations={presentations} now={now} />
       <LimitNotices notices={notices} />
     </div>
   );
