@@ -6,7 +6,10 @@ import {
   countFleetAttention,
   type FleetMachine,
   type FleetThread,
+  fleetLine,
   fleetThreadFromLinked,
+  fleetThreadFromShell,
+  plainLine,
 } from "./fleet.logic";
 
 const laptop = EnvironmentId.make("environment-laptop");
@@ -32,6 +35,7 @@ const thread = (
   settled: false,
   backgroundTaskCount: 0,
   updatedAt: "2026-11-24T09:00:00.000Z",
+  line: null,
   ...fields,
 });
 
@@ -228,5 +232,159 @@ describe("fleetThreadFromLinked", () => {
         machine(box, [fleetThreadFromLinked(box, summary)]),
       ]),
     ).toBe(2);
+  });
+});
+
+describe("fleetLine", () => {
+  const listed: PeerLinkThreadSummary = {
+    threadId: ThreadId.make("remote"),
+    title: "Remote",
+    projectId: null,
+    status: "idle",
+    providerInstanceId: "claude-team",
+    model: "claude-opus-5-5",
+    parentThreadId: null,
+    relationshipToParent: null,
+    delegatedFrom: null,
+    pinned: false,
+    settled: false,
+    blockedOnThreadWait: false,
+    backgroundTaskCount: 0,
+    pendingRequestCount: 0,
+    createdAt: "2026-11-24T08:00:00.000Z",
+    updatedAt: "2026-11-24T09:00:00.000Z",
+  };
+
+  it("shows what a linked agent last said, or was asked, as plain words", () => {
+    expect(
+      fleetThreadFromLinked(box, {
+        ...listed,
+        latestMessage: {
+          author: "agent",
+          text: "## Done\n- **Opened** [the pull request](https://example.test/12) and `vp test` passes",
+        },
+      }).line,
+    ).toEqual({ kind: "said", text: "Done Opened the pull request and vp test passes" });
+    expect(
+      fleetThreadFromLinked(box, {
+        ...listed,
+        latestMessage: { author: "user", text: "Run the nightly build" },
+      }).line,
+    ).toEqual({ kind: "asked", text: "Run the nightly build" });
+    // A machine on an older version lists no message.
+    expect(fleetThreadFromLinked(box, listed).line).toBeNull();
+  });
+
+  it("names a linked plan limit, even once the chat is settled, and says why a run stopped", () => {
+    const limited = fleetThreadFromLinked(box, {
+      ...listed,
+      status: "failed",
+      settled: true,
+      latestMessage: { author: "agent", text: "You've hit your weekly limit · resets Nov 27" },
+      stop: { usageLimit: true, message: "Rate limit reached." },
+    });
+    expect(limited).toMatchObject({
+      attention: "limit",
+      line: { kind: "said", text: "You've hit your weekly limit · resets Nov 27" },
+    });
+    expect(
+      fleetThreadFromLinked(box, {
+        ...listed,
+        status: "failed",
+        stop: { usageLimit: true, message: "Rate limit reached." },
+      }).line,
+    ).toEqual({ kind: "stopped", text: "Rate limit reached." });
+
+    const broke = fleetThreadFromLinked(box, {
+      ...listed,
+      status: "failed",
+      latestMessage: { author: "agent", text: "Running the migration" },
+      stop: { usageLimit: false, message: "The provider closed the connection." },
+    });
+    expect(broke).toMatchObject({
+      attention: "stopped",
+      line: { kind: "stopped", text: "The provider closed the connection." },
+    });
+    // A run that went on after a failure is no longer stopped by it.
+    expect(
+      fleetThreadFromLinked(box, {
+        ...listed,
+        status: "running",
+        stop: { usageLimit: true, message: "Rate limit reached." },
+      }).attention,
+    ).toBeNull();
+  });
+
+  it("names when a connected plan resets, and otherwise uses the message read for the row", () => {
+    const shell = (runtime: Record<string, unknown> | null) =>
+      ({
+        environmentId: laptop,
+        id: ThreadId.make("local"),
+        title: "Local",
+        providerInstanceId: "claude-team",
+        modelSelection: { instanceId: "claude-team", model: "claude-opus-5-5" },
+        lineage: { parentThreadId: null, relationshipToParent: null },
+        runtime:
+          runtime === null
+            ? null
+            : {
+                activeRunId: null,
+                providerInstanceId: "claude-team",
+                providerName: null,
+                lastError: null,
+                updatedAt: "2026-11-24T09:00:00.000Z",
+                ...runtime,
+              },
+        latestRun: null,
+        hasActionableProposedPlan: false,
+        hasPendingApprovals: false,
+        hasPendingUserInput: false,
+        pendingSubagentRequest: null,
+        interactionMode: "default",
+        lastVisitedAt: null,
+        pinnedAt: null,
+        settledAt: null,
+        settledOverride: null,
+        archivedAt: null,
+        deletedAt: null,
+        updatedAt: "2026-11-24T09:00:00.000Z",
+      }) as unknown as Parameters<typeof fleetThreadFromShell>[0];
+    const said = { author: "agent", text: "Checking the changelog" } as const;
+
+    const limited = fleetThreadFromShell(
+      shell({
+        status: "failed",
+        lastError: "Plan limit reached",
+        lastErrorClass: "usage_limit",
+        usageLimitResetAt: "2026-11-27T00:00:00.000Z",
+      }),
+    );
+    expect(limited.attention).toBe("limit");
+    expect(fleetLine(limited, said)).toEqual({ kind: "resets", at: "2026-11-27T00:00:00.000Z" });
+
+    const broke = fleetThreadFromShell(
+      shell({ status: "failed", lastError: "The provider closed\nthe connection." }),
+    );
+    expect(broke.attention).toBe("stopped");
+    expect(fleetLine(broke, said)).toEqual({
+      kind: "stopped",
+      text: "The provider closed the connection.",
+    });
+
+    const quiet = fleetThreadFromShell(shell(null));
+    expect(fleetLine(quiet, said)).toEqual({ kind: "said", text: "Checking the changelog" });
+    expect(fleetLine(quiet, { author: "user", text: "Tidy the docs" })).toEqual({
+      kind: "asked",
+      text: "Tidy the docs",
+    });
+    expect(fleetLine(quiet, undefined)).toBeNull();
+    expect(fleetLine(quiet, { author: "agent", text: "**`  `**" })).toBeNull();
+  });
+
+  it("keeps the words of a line and drops its markdown", () => {
+    expect(plainLine("1. Bump the *version* to 2.0 — see #12")).toBe(
+      "1. Bump the *version* to 2.0 — see #12",
+    );
+    expect(plainLine("> Quoted\n\n* item")).toBe("Quoted item");
   });
 });
