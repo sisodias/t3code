@@ -238,6 +238,36 @@
           ]
         }
       ]
+    },
+    {
+      "name": "usage-billing-dates",
+      "branch": "siso/usage-billing-dates",
+      "base": "upstream",
+      "why": "Show each connected subscription’s paid-through or locally recorded billing date on the Usage tab.",
+      "upstream_pr": null,
+      "tests": [
+        {
+          "cwd": "apps/server",
+          "args": [
+            "vp",
+            "test",
+            "run",
+            "src/provider/codexPaidThrough.test.ts",
+            "src/provider/CodexProvider.test.ts"
+          ]
+        },
+        {
+          "cwd": "apps/web",
+          "args": [
+            "vp",
+            "test",
+            "run",
+            "--project",
+            "browser",
+            "src/components/usage/UsageLimitsPooled.browser.test.tsx"
+          ]
+        }
+      ]
     }
   ],
   "build_checks": [
