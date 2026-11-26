@@ -120,8 +120,10 @@ it("resolves automatic message delivery from authoritative provider capabilities
   );
 });
 
+// No queue: an automatic message sent while the run is still starting targets that run, and the
+// orchestrator holds it for the turn and delivers it as soon as the turn runs.
 it.each(["preparing", "starting"] as const)(
-  "queues an automatic message while the handoff run is %s",
+  "targets the run with an automatic message while the run is %s",
   (status) => {
     const projection = dispatchProjection(baseCapabilities);
     assert.deepEqual(
@@ -130,7 +132,7 @@ it.each(["preparing", "starting"] as const)(
         { type: "start_immediately" },
         "auto",
       ),
-      { type: "queue_after_active" },
+      { type: "steer_active", targetRunId: activeRunId },
     );
   },
 );
@@ -143,27 +145,83 @@ it.each([
     "belongs to a previous attempt",
     [{ runAttemptId: RunAttemptId.make("previous-attempt"), status: "running" }],
   ],
-])("queues only automatic delivery when the active run's provider turn %s", (_, providerTurns) => {
-  const projection = {
-    ...dispatchProjection(baseCapabilities),
-    providerTurns,
+])(
+  "targets the active run with every delivery intent when its provider turn %s",
+  (_, providerTurns) => {
+    const projection = {
+      ...dispatchProjection(baseCapabilities),
+      providerTurns,
+    } as unknown as OrchestrationV2ThreadProjection;
+    assert.deepEqual(
+      CommandPolicy.resolveMessageDispatchIntent(projection, { type: "start_immediately" }, "auto"),
+      { type: "steer_active", targetRunId: activeRunId },
+    );
+    assert.deepEqual(
+      CommandPolicy.resolveMessageDispatchIntent(
+        projection,
+        { type: "start_immediately" },
+        "steer",
+      ),
+      { type: "steer_active", targetRunId: activeRunId },
+    );
+    assert.deepEqual(
+      CommandPolicy.resolveMessageDispatchIntent(
+        projection,
+        { type: "start_immediately" },
+        "restart",
+      ),
+      { type: "restart_active", targetRunId: activeRunId },
+    );
+  },
+);
+
+it("keeps today's queue, and says why, where automatic input cannot join the turn", () => {
+  const cannotSteer = capabilities((current) => ({
+    ...current,
+    turns: { ...current.turns, supportsActiveSteering: false, supportsQueuedMessages: true },
+  }));
+  const starting = dispatchProjection(cannotSteer);
+  const startingNoSteer = {
+    ...starting,
+    runs: starting.runs.map((run) => ({ ...run, status: "starting" })),
   } as unknown as OrchestrationV2ThreadProjection;
   assert.deepEqual(
-    CommandPolicy.resolveMessageDispatchIntent(projection, { type: "start_immediately" }, "auto"),
+    CommandPolicy.resolveMessageDispatchIntent(
+      startingNoSteer,
+      { type: "start_immediately" },
+      "auto",
+    ),
     { type: "queue_after_active" },
   );
-  assert.deepEqual(
-    CommandPolicy.resolveMessageDispatchIntent(projection, { type: "start_immediately" }, "steer"),
-    { type: "steer_active", targetRunId: activeRunId },
+  assert.equal(
+    CommandPolicy.automaticQueueReason(startingNoSteer),
+    "this provider cannot take a message during a turn.",
   );
+  const base = dispatchProjection(baseCapabilities);
+  const waiting = {
+    ...base,
+    runs: base.runs.map((run) => ({ ...run, status: "waiting" })),
+    providerTurns: [{ runAttemptId: activeAttemptId, status: "completed" }],
+  } as unknown as OrchestrationV2ThreadProjection;
   assert.deepEqual(
-    CommandPolicy.resolveMessageDispatchIntent(
-      projection,
-      { type: "start_immediately" },
-      "restart",
-    ),
-    { type: "restart_active", targetRunId: activeRunId },
+    CommandPolicy.resolveMessageDispatchIntent(waiting, { type: "start_immediately" }, "auto"),
+    { type: "queue_after_active" },
   );
+  const compacting = {
+    ...base,
+    messages: [{ id: userMessageId, text: "/compact", attachments: [] }],
+  } as unknown as OrchestrationV2ThreadProjection;
+  assert.deepEqual(
+    CommandPolicy.resolveMessageDispatchIntent(compacting, { type: "start_immediately" }, "auto"),
+    { type: "queue_after_active" },
+  );
+  assert.match(CommandPolicy.automaticQueueReason(compacting) ?? "", /compacting/);
+  assert.isUndefined(CommandPolicy.automaticQueueReason(dispatchProjection()));
+});
+
+it("lets a Claude steer join a running turn without cancelling its tools", () => {
+  assert.isTrue(ClaudeProviderCapabilitiesV2.turns.supportsActiveSteering);
+  assert.notEqual(ClaudeProviderCapabilitiesV2.turns.activeSteeringInterruptsTools, true);
 });
 
 // regression: #26695 an interrupt-restart steer cancels Copilot's background agents

@@ -554,7 +554,12 @@ export const OrchestratorMcpThreadSendInput = Schema.Struct({
   environmentId: OrchestratorMcpEnvironmentTarget,
   threadId: ThreadId,
   message: OrchestratorMcpPrompt,
-  mode: Schema.optional(Schema.Literals(["auto", "queue", "steer", "restart"])),
+  mode: Schema.optional(
+    Schema.Literals(["auto", "queue", "steer", "restart"]).annotate({
+      description:
+        "auto and queue both send into a running turn, where it lands after the current step; a turn still starting takes it as soon as it runs. steer fails when no turn is running. restart replaces the running turn.",
+    }),
+  ),
   freshContext: Schema.optional(
     Schema.Boolean.annotate({
       description:
@@ -579,6 +584,8 @@ export const OrchestratorMcpThreadSendResult = Schema.Struct({
   taskId: Schema.optional(NodeId),
   status: OrchestrationV2RunStatus,
   delivery: Schema.Literals(["started", "queued", "steered", "restarted"]),
+  /** What happens to a message that did not enter the running turn yet, and why. */
+  note: Schema.optional(Schema.String),
 });
 export type OrchestratorMcpThreadSendResult = typeof OrchestratorMcpThreadSendResult.Type;
 

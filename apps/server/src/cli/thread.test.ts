@@ -239,6 +239,62 @@ it.effect(
     ),
 );
 
+it.effect("send prints why a message waits, so one held for a starting turn reads as sent", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-thread-send-note-" });
+    yield* persistServerRuntimeState({
+      path: path.join(baseDir, "userdata", "server-runtime.json"),
+      state: yield* makePersistedServerRuntimeState({
+        config: { host: "127.0.0.1", devUrl: undefined },
+        port: 3_773,
+      }),
+    });
+    const held = "Sent. The turn is still starting; this message enters it as soon as it runs.";
+    let note: string | undefined = held;
+    using _session = vi.spyOn(McpBridge, "mcpToolSession").mockReturnValue(
+      Effect.succeed({
+        call: (tool) =>
+          tool === "t3_thread_send"
+            ? Effect.succeed({
+                structuredContent: {
+                  threadId,
+                  messageId: "message-1",
+                  runId,
+                  status: "queued",
+                  delivery: "queued",
+                  ...(note === undefined ? {} : { note }),
+                },
+              })
+            : Effect.die(`unexpected ${tool} call`),
+      }),
+    );
+    const send = Command.runWith(threadCommand, { version: "0.0.0" })([
+      "send",
+      threadId,
+      "hello",
+      "--base-dir",
+      baseDir,
+    ]);
+    yield* send;
+    assert.strictEqual((yield* TestConsole.logLines).at(-1), held);
+    note = undefined;
+    yield* send;
+    assert.strictEqual((yield* TestConsole.logLines).at(-1), "Queued.");
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(
+      Layer.mergeAll(
+        NodeServices.layer,
+        NodeCrypto.layer,
+        NetService.layer,
+        ConfigProvider.layer(ConfigProvider.fromEnv({ env: { T3CODE_PORT: "3773" } })),
+      ),
+    ),
+  ),
+);
+
 it.effect("does not sign in to whatever took over a dead server's port", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;

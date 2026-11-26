@@ -62,6 +62,7 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
+import { isNativeMaintenanceCommand } from "./CommandPolicy.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -182,6 +183,8 @@ export interface ThreadManagementSendResult {
   readonly run: OrchestrationV2Run;
   readonly turnItem: Extract<OrchestrationV2TurnItem, { readonly type: "user_message" }> | null;
   readonly delivery: "started" | "queued" | "steered" | "restarted";
+  /** What happens to a message that did not enter the running turn yet, and why. */
+  readonly note?: string;
 }
 
 export interface ThreadManagementWaitInput {
@@ -918,12 +921,17 @@ const make = Effect.gen(function* () {
       });
     }
     const steerableRun = latestSteerableRun(target);
-    // A fresh send, or one that asks for a result, never joins a running turn.
-    const mode =
-      (input.freshContext || input.outputSchema !== undefined) &&
-      (input.mode === "steer" || input.mode === "restart")
+    // "queue" delivers like "auto": into the running turn after its current step. Kept as a new
+    // turn: a fresh send (self-compact relies on it), one that asks for a result, restart, and
+    // /compact or /logout, which the provider runs only as their own turn.
+    const maintenance = isNativeMaintenanceCommand(input);
+    const ownTurn = input.freshContext || input.outputSchema !== undefined;
+    const mode: ThreadManagementSendMode =
+      maintenance || (ownTurn && (input.mode === "steer" || input.mode === "restart"))
         ? "queue"
-        : input.mode;
+        : input.mode === "queue" && !ownTurn
+          ? "auto"
+          : input.mode;
     const explicitSteer = mode === "steer" || mode === "restart";
     const missingSteeringTarget = explicitSteer && steerableRun === undefined;
     // A command receipt outlives its target turn. Dispatch validates and replays it.
@@ -1023,6 +1031,20 @@ const make = Effect.gen(function* () {
           event.payload.type === "run_interrupt_request" &&
           event.payload.runId !== run.id,
       );
+    const note =
+      turnItem !== null && turnItem.inputIntent !== "queued_turn"
+        ? undefined
+        : run.steerWhenReadyRunId !== undefined
+          ? "Sent. The turn is still starting; this message enters it as soon as it runs."
+          : run.queueReason !== undefined
+            ? `Queued: ${run.queueReason}`
+            : run.freshContext === true
+              ? "Queued: a fresh-context message starts its own session after the current turn."
+              : input.outputSchema !== undefined
+                ? "Queued: a message that asks for a result starts its own turn after the current one."
+                : maintenance
+                  ? "Queued: /compact and /logout run as their own turn after the current one."
+                  : undefined;
     const delivery: ThreadManagementSendResult["delivery"] = restartedAsNextTurn
       ? "restarted"
       : turnItem === null || turnItem.inputIntent === "queued_turn"
@@ -1032,7 +1054,15 @@ const make = Effect.gen(function* () {
           : mode === "restart"
             ? "restarted"
             : "steered";
-    return { dispatch: dispatched, projection, message, run, turnItem, delivery };
+    return {
+      dispatch: dispatched,
+      projection,
+      message,
+      run,
+      turnItem,
+      delivery,
+      ...(note === undefined ? {} : { note }),
+    };
   });
 
   const submitRunOutput: ThreadManagementServiceShape["submitRunOutput"] = Effect.fn(

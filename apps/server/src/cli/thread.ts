@@ -1011,7 +1011,7 @@ const threadSendCommand = Command.make("send", {
   json: jsonFlag,
 }).pipe(
   Command.withDescription(
-    "Send a message to a thread. A busy thread gets it as its next turn; nothing is interrupted.",
+    "Send a message to a thread. A busy thread gets it in its running turn after the current step; nothing is interrupted.",
   ),
   Command.withHandler((flags) =>
     Effect.gen(function* () {
@@ -1038,7 +1038,7 @@ const threadSendCommand = Command.make("send", {
           }
           yield* flags.json
             ? printJson(sent)
-            : Console.log(sent.delivery === "queued" ? "Queued." : "Sent.");
+            : Console.log(sent.note ?? (sent.delivery === "queued" ? "Queued." : "Sent."));
         }),
       );
     }).pipe(reportThreadErrors),
