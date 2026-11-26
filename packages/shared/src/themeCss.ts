@@ -102,6 +102,7 @@ export const THEME_GUIDE = [
   "For a background, pass `background`: the absolute path of a JPEG, PNG, or WebP image up to 16 MB, or a WebM or MP4 video up to 64 MB. It is copied beside the theme file and replaces the last one. Delete `<themesDir>/<themeId>.<extension>` to remove it.",
   'CSS shows an image with `var(--theme-background-image)`, such as `[data-workspace-area="conversation"] { background: var(--theme-background-image) center / cover no-repeat; }`.',
   "A video plays muted and looping behind the app as `[data-theme-background-video]`, paused while the window is hidden or the system reduces motion. It shows only where the CSS makes surfaces transparent or translucent. Do not embed images in `css`: it holds 100,000 characters.",
+  'For a live background, set `backgroundPage` to an https page that draws itself, such as an animated scene. It runs in a sandboxed frame behind the app and posts `{ type: "t3-background-page", state: "ready" }` to its parent once it has drawn. Until then `html[data-theme-background-page]` is `loading` and the body stays opaque, so keep a still background as the fallback and switch surfaces to transparent under `html[data-theme-background-page="ready"]`. Reduced motion shows no page.',
   "The app's own rules can be more specific. If a rule has no effect, add !important.",
   "It cannot reach the terminal text, the file tree, or diff internals. Use color roles for those.",
   "Native scrollbars take `::-webkit-scrollbar` and `::-webkit-scrollbar-thumb`.",
